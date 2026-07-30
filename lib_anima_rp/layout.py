@@ -59,25 +59,37 @@ def _spans(sizes):
     return spans
 
 
+def _parse_ratio_structure(ratios: str, mmode: str):
+    """把 Divide ratio 字符串解析成 (bands, cell_rows) 结构。
+
+    `parse_layout` 与 `parse_base_weights` 共用这一处逻辑（一维/二维分支判断，
+    以及数值校验：空值、非数字、非正数一律 `ValueError`）。二者都只需要区域
+    结构本身，若各自重新实现一遍分支判断，校验行为迟早会分叉——`parse_layout`
+    早年就出现过这种分叉：只有二维分支复用了 `_split_bands`（因而会校验），
+    一维分支自己重写了一遍且完全没做数值校验。抽成这一个函数，两处的校验
+    行为由构造保证一致。
+    """
+    text = ratios.strip()
+    if not text:
+        raise ValueError("Divide ratio 不能为空")
+
+    # 一维分支：字面不含 ';'，与 RP regions.py:281 一致，对两种 mmode 都用字面 ';' 检测
+    if _BAND_DELIM not in text:
+        cells = _to_positive_floats(text.split(_CELL_DELIM), "带内单元")
+        return [1.0], [cells]
+    return _split_bands(text, mmode)
+
+
 def parse_layout(ratios: str, mmode: str, flipper: bool = False) -> list[Rect]:
     """把 Divide ratio 字符串解析成区域矩形列表，band-major 顺序。"""
     if mmode not in VALID_MMODES:
         raise ValueError(f"未知的 mmode：{mmode!r}，只接受 {VALID_MMODES}")
 
     text = ratios.strip()
-    if not text:
-        raise ValueError("Divide ratio 不能为空")
-
     if flipper:
         text = swap_delimiters(text)
 
-    # 一维分支：字面不含 ';'，与 RP regions.py:281 一致，对两种 mmode 都用字面 ';' 检测
-    if _BAND_DELIM not in text:
-        cells = _to_positive_floats(text.split(_CELL_DELIM), "带内单元")
-        bands = [1.0]
-        cell_rows = [cells]
-    else:
-        bands, cell_rows = _split_bands(text, mmode)
+    bands, cell_rows = _parse_ratio_structure(text, mmode)
 
     flipped = mmode == ROWS
     band_spans = _spans(bands)
@@ -147,15 +159,12 @@ def parse_base_weights(baseratios: str, ratios: str, mmode: str) -> list[float]:
     if mmode not in VALID_MMODES:
         raise ValueError(f"未知的 mmode：{mmode!r}，只接受 {VALID_MMODES}")
 
-    # 1. 计算区域的带/单元结构（形状）。分支逻辑必须与 parse_layout 一致：
-    #    一维分支（原串不含 ';'）按 RP 的 DELIMROW 检测是恒定的，不受 mmode 影响；
-    #    二维分支复用 _split_bands（已被 tests/test_layout_rp_parity.py 独立验证）。
-    text = ratios.strip()
-    if _BAND_DELIM not in text:
-        cell_rows_shape = [len(text.split(_CELL_DELIM))]
-    else:
-        _, cell_rows = _split_bands(text, mmode)
-        cell_rows_shape = [len(row) for row in cell_rows]
+    # 1. 计算区域的带/单元结构（形状）。与 parse_layout 共用 _parse_ratio_structure，
+    #    保证对非法 ratios（负数、非数字、空串、只有分隔符等）的校验行为完全一致，
+    #    不会像此前那样因为各自重写一遍分支判断而在某一分支上分叉
+    #    （此前二维分支复用 _split_bands 会校验，一维分支自己重写却完全不校验）。
+    _, cell_rows = _parse_ratio_structure(ratios, mmode)
+    cell_rows_shape = [len(row) for row in cell_rows]
 
     # 2. baseratios 自身的行/列分隔符角色由 mmode 决定（对应 RP 的 indflip）
     if mmode == ROWS:

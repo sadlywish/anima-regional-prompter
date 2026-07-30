@@ -20,6 +20,16 @@ CASES = [
     ("2,3;1,1,1;4,5", "Columns", False),
     ("1,1,1;3", "Columns", True),
     ("1;2;1;1,2;4;6", "Columns", True),
+    # 以下四条是为了让 tests/test_base_weights_rp_parity.py 用到的每个
+    # (ratios, mmode) 带/单元形状都能在这里找到一个完全独立的对照点
+    # （rp_reference_rects 直接调 RP 的 split_l2，不经过我们的 _split_bands）。
+    # 起因：复审在 _split_bands 里注入过一个只在特定形状下才现形的 bug，
+    # 而当时这四种形状都不在本文件里，导致独立锚点也没能抓住——它依赖的
+    # parse_layout 和被测实现共用同一个 _split_bands，一起被那个 bug 带偏了。
+    ("1,1,1", "Columns", False),
+    ("1,1,1,1", "Columns", False),
+    ("1,1,1;2,2", "Columns", False),
+    ("1,2,1;2,3,1", "Rows", False),
 ]
 
 TOL = 1e-9

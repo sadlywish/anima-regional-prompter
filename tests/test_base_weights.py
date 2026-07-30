@@ -97,3 +97,28 @@ def test_rows_mode_swaps_base_ratios_delimiter_roles():
 def test_unknown_mmode_raises():
     with pytest.raises(ValueError):
         parse_base_weights("0.2", "1,1", "Diagonal")
+
+
+def test_invalid_ratios_raises_for_1d():
+    # 一维分支此前完全不校验 ratios（只数逗号个数），负数/非数字会被静默接受。
+    # parse_layout 对同样的字符串会抛 ValueError，parse_base_weights 必须一致。
+    with pytest.raises(ValueError):
+        parse_base_weights("0.2", "1,-5,abc", "Columns")
+
+
+def test_empty_ratios_raises():
+    with pytest.raises(ValueError):
+        parse_base_weights("0.2", "", "Columns")
+
+
+def test_ratios_with_only_delimiter_raises():
+    # 只有分隔符（等价于两个空值之间夹着一个逗号）在一维分支下此前也不会报错。
+    with pytest.raises(ValueError):
+        parse_base_weights("0.2", ",", "Columns")
+
+
+def test_invalid_ratios_raises_for_2d():
+    # 二维分支复用 _split_bands，此前就已经会校验；这里补一个回归测试，
+    # 确保重构后二维分支的校验行为不受影响。
+    with pytest.raises(ValueError):
+        parse_base_weights("0.2", "1,2,1,1;2,-4,6", "Columns")
