@@ -136,10 +136,15 @@ F:\anima-regional-prompter\
 
 ### 4.1 Divide ratio 语法
 
-`;` 分隔外层带（band），`,` 分隔带内单元（cell）。
+**权威参照是 RP 的 `regions.py:274 makeimgtmp`。** 预览路径与生成路径共用它——
+生成时 `rp.py:1004 keyconverter` 调用 `makeimgtmp(..., inprocess=True)` 把 `BREAK`
+转成 `ADDROW`/`ADDCOL`，再由 `matrixdealer` 按该结构还原区域。因此复刻 `makeimgtmp`
+的分支即可获得完全一致的布局。
+
+分隔符分两层：**外层带（band）** 与 **带内单元（cell）**。
 **每个带的第一个数字是该带自身的尺寸，其余数字是带内细分。**
-（依据：RP `scripts/regions.py:45` 注释「First value in each row is the row's ratio,
-the rest are col ratios」，及 `split_l2(..., indsingles=True)` 的实现。）
+（依据 `regions.py:45` 注释「First value in each row is the row's ratio, the rest are
+col ratios」，及 `split_l2(..., indsingles=True)` 在 `regions.py:129-131` 的实现。）
 
 ```
 1,2,1,1;2,4,6      Main Splitting: Columns
@@ -151,12 +156,26 @@ the rest are col ratios」，及 `split_l2(..., indsingles=True)` 的实现。�
 └───────┴──────┘
 ```
 
+**哪个符号是外层分隔符取决于 `mmode`。** `split_l2` 在 `indflip=True` 时交换
+`kr`/`kc`（`regions.py:118-121`）：
+
+| `mmode` | 外层带分隔符 | 带内 cell 分隔符 |
+|---------|-------------|-----------------|
+| `Columns` | `;` | `,` |
+| `Rows` | `,` | `;` |
+
+所以 `Rows` 模式下同一版面写作 `1;2;1;1,2;4;6`——是 `Columns` 版本的转置，
+连分隔符一起转置。
+
 特例：
 
-- **不含 `;`** → 一维。整个字符串是单个带的 cells，带尺寸为 1。
-  `1,1,1` → 3 个等分单元。
-- **某带只有一个数字** → 该带尺寸为此数，带内为单个 cell 铺满。
-- 尺寸与 cell 值各自按其所在层归一化（带尺寸按所有带之和，cell 按同带内之和）。
+- **原字符串不含 `;`** → 走一维分支（`regions.py:281`，该判断对两种 `mmode` 都用字面
+  `;` 检测）。此时整个字符串是单个带的 cells，带尺寸为 1，且 `split_l2` 以
+  `indflip=False` 调用。`1,1,1` 在 `Columns` 下是 3 列、在 `Rows` 下是 3 行。
+- **某带只有一个数字** → `lcells = row[1:] if len(row) > 1 else row`
+  （`regions.py:131`），即该带尺寸为此数，带内为单个 cell 铺满。
+- 尺寸与 cell 值各自按其所在层归一化（带尺寸按所有带之和，cell 按同带内之和），
+  对应 `ratiosdealer` 的 `list_percentify` → `list_cumsum` → `list_rangify`。
 
 ### 4.2 方向语义（`mmode`）
 
@@ -179,6 +198,10 @@ UI 上提供**实时布局预览**（CSS grid 渲染 + 区域编号），使方�
 
 RP 的 `flipper` 参数（UI 标签 `flip "," and ";"`）在解析前交换两个分隔符，
 等价于 RP 的 `changecs()`（`regions.py:268`）。实现为解析入口处的一次字符串置换。
+配合 §4.2 的分隔符表使用：`Rows` 模式勾上 `flipper` 后即可用 `Columns` 的写法。
+
+**只作用于 `ratios`，不作用于 `baseratios`。** RP 在 `rp.py:386` 只对 `aratios`
+调用 `changecs`。这是个不对称设计，但为兼容而照搬，并写入 README。
 
 ### 4.4 区域编号
 
@@ -213,7 +236,12 @@ def parse_base_weights(baseratios: str, layout: list[Rect], mmode: str,
 
 `parse_layout` 须对以下输入抛 `ValueError`：非数字、负数、全零比例、空字符串。
 
-**区域数与提示词段数不匹配同样抛 `ValueError`，不静默降级。** 这是跨模块检查
+**提示词中完全不含任何分隔关键字时，整个扩展静默不生效**（不分区、不报错、不警告），
+与 RP `rp.py:359` 的 `if not any(key in tprompt for key in ALLALLKEYS) ... return` 一致。
+这是 x/y 图、批量任务里的常见状态：开关开着但当前提示词没写 `BREAK`。若在此报错，
+迁移过来的批量任务会大面积失败。
+
+提示词**含**分隔关键字、但**区域数与段数不匹配**时抛 `ValueError`，不静默降级。这是跨模块检查
 （`parse_layout` 的输出 vs `split_prompt` 的输出），放在 `state.build_config()` 里，
 在注入 `transformer_options` 之前完成。RP 在这里会静默补齐最后一段提示词
 （`regions.py:383-384`），导致「少写一个 BREAK 后画面莫名其妙」这类难以排查的问题。
@@ -345,9 +373,13 @@ cross-attn 只占 Block 总开销的一小部分，N=3 时预期整体 1.3–1.6
 
 ### 7.3 dtype / device
 
-`region_conds` 在使用前 `.to(device=x.device, dtype=context.dtype)`。
-注意 `Anima.forward` 把残差流保持在 fp32 但 attention 输入被 `.to(compute_dtype)`，
-所以对齐目标是**传入的 `context` 的 dtype**，不是 `x` 的。
+`region_conds` 与 `masks` 在使用前统一 `.to(device=x.device, dtype=x.dtype)`。
+
+`Anima.forward` 把残差流保持在 fp32，但 `Block.forward` 在调用 cross-attn 前已对输入做
+`.to(compute_dtype)`，而 `compute_dtype` 就是 `crossattn_emb` 的 dtype
+（见 `final_layer` 调用处的 `.to(crossattn_emb.dtype)`）。因此**进入 hook 时
+`x.dtype` 与 `context.dtype` 已经相同**，取 `x.dtype` 更直接，也保证输出 dtype 与
+残差流的期望一致。
 
 ### 7.4 latent 网格尺寸的获取
 
@@ -499,9 +531,37 @@ RP Unsupported:  (仅在发生降级时出现)
 
 ### 11.2 与 RP 的布局一致性验证
 
-RP 的 `regions.py` 除 numpy/PIL/torch 外只额外 `from modules import devices`，
-测试中注入一个 stub 模块即可导入。用一组 Divide ratio 样例分别跑 RP 的
-`split_l2` + `ratiosdealer` 与我们的 `parse_layout`，断言矩形一致。
+RP 的 `regions.py` 除 numpy/PIL/gradio/torch 外只额外 `from modules import devices`，
+测试中注入一个 stub 模块即可导入。
+
+参照实现按 `makeimgtmp`（`regions.py:274-300`）的分支复刻，直接调用 RP 自己的
+`split_l2` / `ratiosdealer`：
+
+```python
+def rp_reference_rects(ratios, mmode, flipper):
+    mode = {"Columns": "Horizontal", "Rows": "Vertical"}[mmode]
+    if flipper:
+        ratios = rp_regions.changecs(ratios)
+    indflip = "Ver" in mode
+    if ";" not in ratios:
+        cells = rp_regions.split_l2(ratios, ";", ",",
+                                    fmap=rp_regions.ffloatd(1), indflip=False)
+        bands = [1]
+    else:
+        bands, cells = rp_regions.split_l2(ratios, ";", ",", indsingles=True,
+                                           fmap=rp_regions.ffloatd(1), indflip=indflip)
+    cells, bands = rp_regions.ratiosdealer(cells, bands)
+    out = []
+    for bi, band in enumerate(bands):
+        for cell in cells[bi]:
+            if not indflip:
+                out.append(Rect(cell[0], band[0], cell[1], band[1]))
+            else:
+                out.append(Rect(band[0], cell[0], band[1], cell[1]))
+    return out
+```
+
+用一组 Divide ratio 样例断言它与我们的 `parse_layout` 逐个矩形相等。
 这把「格式兼容」从人工比对变成可执行断言。
 
 RP 源码路径由环境变量 `RP_REFERENCE_PATH` 指定（开发机上为
