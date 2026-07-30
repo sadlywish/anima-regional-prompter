@@ -28,11 +28,30 @@ def test_too_many_values_truncated():
 
 
 def test_band_structure_is_flattened_band_major():
-    # 7 个区域（显示字符中的单元数）：带 1 有 4 个，带 2 有 3 个
-    # 全局流情况（无 ';'）：支持跨带溢出
+    # 5 个区域：带 1 有 3 个，带 2 有 2 个（带尺寸值本身不计入单元数）
     assert_weights(
-        parse_base_weights("0.1,0.2,0.3,0.4,0.5", "1,2,1,1;2,4,6", "Columns"),
-        [0.1, 0.2, 0.3, 0.4, 0.5, 0.5, 0.5],
+        parse_base_weights("0.1,0.2,0.3;0.4,0.5", "1,2,1,1;2,4,6", "Columns"),
+        [0.1, 0.2, 0.3, 0.4, 0.5],
+    )
+
+
+def test_band_underfilled_repeats_own_last_value():
+    # 反例（对照 RP split_l2 basestruct 分支实跑得出）：
+    # 带 1 需要 3 个单元，段 "0.1,0.2" 只有 2 个值，用段自己的最后值(0.2)补齐；
+    # 带 2 需要 2 个单元，段 "0.3,0.4" 恰好对齐。
+    assert_weights(
+        parse_base_weights("0.1,0.2;0.3,0.4", "1,2,1,1;2,4,6", "Columns"),
+        [0.1, 0.2, 0.2, 0.3, 0.4],
+    )
+
+
+def test_band_overfilled_spills_into_next_band():
+    # 反例（对照 RP split_l2 basestruct 分支实跑得出）：
+    # 段 "0.1,0.2,0.3,0.4" 有 4 个值，带 1 只需要 3 个，截断后剩余的 0.4
+    # 溢出到带 2（带 2 需要 2 个单元，0.4 重复补齐）。
+    assert_weights(
+        parse_base_weights("0.1,0.2,0.3,0.4;0.5", "1,2,1,1;2,4,6", "Columns"),
+        [0.1, 0.2, 0.3, 0.4, 0.4],
     )
 
 
@@ -46,13 +65,35 @@ def test_empty_string_is_all_zero():
 
 
 def test_flipper_does_not_apply_to_base_ratios():
-    # RP rp.py:386 只对 aratios 调 changecs，baseratios 原样使用。
-    # 在 baseratios 里 ';' 与 ',' 同义（都只是值分隔符），故两种写法结果相同。
-    assert_weights(
-        parse_base_weights("0.1;0.2", "1,1", "Columns"),
-        parse_base_weights("0.1,0.2", "1,1", "Columns"),
-    )
+    # RP rp.py:386 只对 aratios 调 changecs，baseratios 完全不受 flipper 开关影响
+    # （本函数干脆不接受 flipper 参数，从签名上就杜绝了这个可能性）。
+    #
+    # 注意：这不意味着 ';' 与 ',' 在 baseratios 里是同义的。经对照 RP 源码
+    # （split_l2 的 basestruct 分支）直接实跑验证，二者结果并不相同：
+    # "0.1;0.2" 按 ';' 切成两段，每段单独匹配一个带；该带（"1,1"）只有 2 个
+    # 单元，第一段 "0.1" 就已用重复自身最后值的方式填满（[0.1, 0.1]），
+    # 带已耗尽，第二段 "0.2" 被丢弃。而 "0.1,0.2" 是同一段里的两个值，
+    # 直接一一对应两个单元（[0.1, 0.2]）。
+    assert_weights(parse_base_weights("0.1;0.2", "1,1", "Columns"), [0.1, 0.1])
+    assert_weights(parse_base_weights("0.1,0.2", "1,1", "Columns"), [0.1, 0.2])
 
 
 def test_out_of_range_is_clamped():
     assert_weights(parse_base_weights("-1,5", "1,1", "Columns"), [0.0, 1.0])
+
+
+def test_rows_mode_swaps_base_ratios_delimiter_roles():
+    # mmode 会影响 baseratios 自身的分隔符角色（对应 RP 的 indflip = "Ver" in mode，
+    # regions.py:379 对 bratios 的 split_l2 调用同样传入 indflip）。这与 flipper
+    # 开关无关，是 mmode 参数本身的行为，与 aratios 的处理完全对称。
+    # Rows 模式下 ',' 反而充当"行分隔符"：整段 "0.1,0.2,0.3" 被视作 3 个独立的
+    # 单值段，第一段就已把唯一的带（3 个单元）填满，其余两段被丢弃。
+    assert_weights(
+        parse_base_weights("0.1,0.2,0.3", "1,1,1", "Rows"),
+        [0.1, 0.1, 0.1],
+    )
+
+
+def test_unknown_mmode_raises():
+    with pytest.raises(ValueError):
+        parse_base_weights("0.2", "1,1", "Diagonal")
