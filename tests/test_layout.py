@@ -68,3 +68,78 @@ def test_rejects_all_zero():
 def test_rejects_unknown_mmode():
     with pytest.raises(ValueError, match="mmode"):
         parse_layout("1,1", "Diagonal")
+
+
+def test_two_dimensions_columns():
+    # 带 1 尺寸 1、带内 2:1:1；带 2 尺寸 2、带内 4:6
+    rects = parse_layout("1,2,1,1;2,4,6", "Columns")
+    assert_rects_close(
+        rects,
+        [
+            Rect(0.0, 0.0, 0.5, 1 / 3),
+            Rect(0.5, 0.0, 0.75, 1 / 3),
+            Rect(0.75, 0.0, 1.0, 1 / 3),
+            Rect(0.0, 1 / 3, 0.4, 1.0),
+            Rect(0.4, 1 / 3, 1.0, 1.0),
+        ],
+    )
+
+
+def test_two_dimensions_rows_is_transpose():
+    # Rows 模式下分隔符一并转置，得到 Columns 版本的转置版面
+    rects = parse_layout("1;2;1;1,2;4;6", "Rows")
+    assert_rects_close(
+        rects,
+        [
+            Rect(0.0, 0.0, 1 / 3, 0.5),
+            Rect(0.0, 0.5, 1 / 3, 0.75),
+            Rect(0.0, 0.75, 1 / 3, 1.0),
+            Rect(1 / 3, 0.0, 1.0, 0.4),
+            Rect(1 / 3, 0.4, 1.0, 1.0),
+        ],
+    )
+
+
+def test_band_with_single_value_fills_band():
+    # 带 2 只给一个数字：尺寸为 3，带内单个单元铺满
+    rects = parse_layout("1,1,1;3", "Columns")
+    assert_rects_close(
+        rects,
+        [
+            Rect(0.0, 0.0, 0.5, 0.25),
+            Rect(0.5, 0.0, 1.0, 0.25),
+            Rect(0.0, 0.25, 1.0, 1.0),
+        ],
+    )
+
+
+def test_flipper_makes_rows_accept_columns_syntax():
+    flipped = parse_layout("1,2,1,1;2,4,6", "Rows", flipper=True)
+    direct = parse_layout("1;2;1;1,2;4;6", "Rows")
+    assert_rects_close(flipped, direct)
+
+
+def test_flipper_does_not_affect_one_dimension_shape():
+    # "1,1" 翻转后是 "1;1"，含 ';' 故走二维分支：两个带，各自单值铺满
+    rects = parse_layout("1,1", "Columns", flipper=True)
+    assert_rects_close(
+        rects, [Rect(0.0, 0.0, 1.0, 0.5), Rect(0.0, 0.5, 1.0, 1.0)]
+    )
+
+
+def test_edge_clipping_with_non_power_of_two_ratios():
+    """验证分母不是 2 的幂时，最后一段仍贴边到 1.0。
+
+    十等分 "1,1,1,1,1,1,1,1,1,1" 会产生浮点累积误差：最后一段末尾不是 1.0，
+    而是 0.9999999999... 。_spans 函数中最后一行 `spans[-1] = (spans[-1][0], 1.0)`
+    用于消除这个误差。此测试用 == 而非近似比较锁住这个边界，防止该行代码被误删。
+    """
+    # Columns 模式：十等分横向
+    rects = parse_layout("1,1,1,1,1,1,1,1,1,1", "Columns")
+    # 第十个 rect 的 x1 必须恰好等于 1.0
+    assert rects[9].x1 == 1.0, f"第十个 rect 的 x1={rects[9].x1}，不是 1.0"
+
+    # Rows 模式：十等分纵向
+    rects = parse_layout("1,1,1,1,1,1,1,1,1,1", "Rows")
+    # 第十个 rect 的 y1 必须恰好等于 1.0
+    assert rects[9].y1 == 1.0, f"第十个 rect 的 y1={rects[9].y1}，不是 1.0"
