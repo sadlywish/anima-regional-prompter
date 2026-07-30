@@ -28,10 +28,11 @@ def test_too_many_values_truncated():
 
 
 def test_band_structure_is_flattened_band_major():
-    # 5 个区域：带 1 有 3 个，带 2 有 2 个
+    # 7 个区域（显示字符中的单元数）：带 1 有 4 个，带 2 有 3 个
+    # 全局流情况（无 ';'）：支持跨带溢出
     assert_weights(
-        parse_base_weights("0.1,0.2,0.3;0.4,0.5", "1,2,1,1;2,4,6", "Columns"),
-        [0.1, 0.2, 0.3, 0.4, 0.5],
+        parse_base_weights("0.1,0.2,0.3,0.4,0.5", "1,2,1,1;2,4,6", "Columns"),
+        [0.1, 0.2, 0.3, 0.4, 0.5, 0.5, 0.5],
     )
 
 

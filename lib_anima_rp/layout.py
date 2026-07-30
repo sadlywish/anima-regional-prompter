@@ -119,23 +119,103 @@ def _float_or_zero(text):
 def parse_base_weights(baseratios: str, ratios: str, mmode: str) -> list[float]:
     """把 Base ratio 字符串展开成与区域一一对应的权重列表。
 
-    广播规则（RP split_l2 的 basestruct 行为）：值不足时重复最后一个，多余的截断。
+    广播规则（RP split_l2 的 basestruct 行为）：
+    - 如果 baseratios 含 ';'：各分段对应各带，逐带独立处理
+    - 如果 baseratios 不含 ';'：全局值流，从左到右分配（支持溢出）
+    - 带内不足 → 重复该带的最后值填满
+    - 带已用完 → 剩余值全部丢弃
 
     **本函数不接受 flipper。** RP 在 rp.py:386 只对 aratios 调用 changecs，
     baseratios 原样使用；而区域**数量**与 flipper 无关（交换分隔符只改变版面朝向）。
-    因此这里恒以 flipper=False 解析布局，只为取区域数量。
+    因此这里恒以 flipper=False 解析布局。baseratios 总是用固定的 ';' 和 ','，
+    不受 mmode 影响。
     """
-    region_count = len(parse_layout(ratios, mmode, flipper=False))
+    # 获取布局的带/单元结构（固定 flipper=False）
+    # 注意：这里按 ratios 的原始字符串来计算单元数，不应用 _split_bands 的逻辑
+    text = ratios.strip()
+    if mmode == ROWS:
+        ratio_band_delim, ratio_cell_delim = _CELL_DELIM, _BAND_DELIM
+    else:
+        ratio_band_delim, ratio_cell_delim = _BAND_DELIM, _CELL_DELIM
 
+    # 构造每带的 cell 数列表（按字符串的逗号/分号分割数）
+    cell_counts = []
+    if ratio_band_delim not in text:
+        # 一维分支：单带
+        cell_counts.append(len(text.split(ratio_cell_delim)))
+    else:
+        # 二维分支
+        for band_text in text.split(ratio_band_delim):
+            # 直接按分隔符计算，不处理"第一个值是带宽度"
+            cells = band_text.split(ratio_cell_delim)
+            cell_counts.append(len(cells))
+
+    # 解析 baseratios：总是用固定的 ';' 和 ',' 作为分隔符，不受 mmode 影响
+    # RP 的逻辑（split_l2 with basestruct）：
+    # - 如果 baseratios 有 ';'：按 ';' 分隔，每段对应一个带（不支持跨带溢出）
+    # - 如果 baseratios 无 ';'：全局值流（支持跨带溢出）
+    # - 特例：单带情况下，';' 和 ',' 等价
     raw = baseratios.strip()
     if not raw:
-        values = [0.0]
+        value_stream = [0.0]
+        has_band_sep = False
     else:
-        values = [_float_or_zero(part) for part in raw.replace(";", ",").split(",")]
-    if not values:
-        values = [0.0]
+        has_band_sep = _BAND_DELIM in raw and len(cell_counts) > 1
 
-    if len(values) < region_count:
-        values = values + [values[-1]] * (region_count - len(values))
-    weights = values[:region_count]
-    return [min(1.0, max(0.0, w)) for w in weights]
+    if has_band_sep:
+        # 有 ';' 且多带：按 ';' 分隔，每段对应一个带
+        sub_streams = []
+        for part in raw.split(_BAND_DELIM):
+            if not part:
+                sub_streams.append([0.0])
+            else:
+                sub_streams.append([_float_or_zero(x) for x in part.split(_CELL_DELIM)])
+
+        result = []
+        for band_idx, cell_count in enumerate(cell_counts):
+            if band_idx < len(sub_streams):
+                stream = sub_streams[band_idx]
+            else:
+                stream = [0.0]
+
+            band_values = []
+            last_value = 0.0
+            for cell_idx in range(cell_count):
+                if cell_idx < len(stream):
+                    value = stream[cell_idx]
+                    band_values.append(value)
+                    last_value = value
+                else:
+                    band_values.append(last_value)
+
+            result.extend(band_values)
+    else:
+        # 无 ';' 或单带：全局值流
+        if not raw:
+            value_stream = [0.0]
+        else:
+            # 单带情况：';' 和 ',' 都是值分隔符
+            value_stream = [_float_or_zero(x) for x in raw.replace(_BAND_DELIM, _CELL_DELIM).split(_CELL_DELIM)]
+            if not value_stream:
+                value_stream = [0.0]
+
+        result = []
+        stream_idx = 0
+        last_value = 0.0
+
+        for band_idx, cell_count in enumerate(cell_counts):
+            band_values = []
+
+            for cell_idx in range(cell_count):
+                if stream_idx < len(value_stream):
+                    value = value_stream[stream_idx]
+                    band_values.append(value)
+                    last_value = value
+                    stream_idx += 1
+                else:
+                    band_values.append(last_value)
+
+            result.extend(band_values)
+
+    # Clamp 到 [0, 1]
+    return [min(1.0, max(0.0, w)) for w in result]
