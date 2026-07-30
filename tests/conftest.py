@@ -50,6 +50,9 @@ def _load_rp_regions(path, rp_path_explicit):
             modules_stub = types.ModuleType("modules")
             devices_stub = types.ModuleType("modules.devices")
             devices_stub.device = "cpu"
+            # 给 stub 打上私有标记属性，以便测试验证清理
+            modules_stub._anima_rp_stub = True
+            devices_stub._anima_rp_stub = True
             modules_stub.devices = devices_stub
             sys.modules["modules"] = modules_stub
             sys.modules["modules.devices"] = devices_stub
@@ -58,13 +61,7 @@ def _load_rp_regions(path, rp_path_explicit):
         # 导入模块
         spec = importlib.util.spec_from_file_location("rp_regions_reference", path)
         module = importlib.util.module_from_spec(spec)
-        try:
-            spec.loader.exec_module(module)
-        except Exception as exc:
-            # 导入失败时：
-            # - 显式设置时 → FAIL
-            # - 默认路径时 → FAIL（因为路径已存在）
-            raise
+        spec.loader.exec_module(module)
 
         return module
     finally:
