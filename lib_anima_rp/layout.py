@@ -106,3 +106,36 @@ def _split_bands(text, mmode):
         # RP regions.py:131 —— 只有一个值时该值同时充当带尺寸与唯一单元
         cell_rows.append(values[1:] if len(values) > 1 else values)
     return bands, cell_rows
+
+
+def _float_or_zero(text):
+    """RP 的 ffloatd(0)：非数字退化为 0 而不是报错。"""
+    try:
+        return float(text.strip())
+    except ValueError:
+        return 0.0
+
+
+def parse_base_weights(baseratios: str, ratios: str, mmode: str) -> list[float]:
+    """把 Base ratio 字符串展开成与区域一一对应的权重列表。
+
+    广播规则（RP split_l2 的 basestruct 行为）：值不足时重复最后一个，多余的截断。
+
+    **本函数不接受 flipper。** RP 在 rp.py:386 只对 aratios 调用 changecs，
+    baseratios 原样使用；而区域**数量**与 flipper 无关（交换分隔符只改变版面朝向）。
+    因此这里恒以 flipper=False 解析布局，只为取区域数量。
+    """
+    region_count = len(parse_layout(ratios, mmode, flipper=False))
+
+    raw = baseratios.strip()
+    if not raw:
+        values = [0.0]
+    else:
+        values = [_float_or_zero(part) for part in raw.replace(";", ",").split(",")]
+    if not values:
+        values = [0.0]
+
+    if len(values) < region_count:
+        values = values + [values[-1]] * (region_count - len(values))
+    weights = values[:region_count]
+    return [min(1.0, max(0.0, w)) for w in weights]

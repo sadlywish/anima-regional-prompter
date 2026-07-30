@@ -18,6 +18,8 @@ CASES = [
     ("1,1,1;3", "Columns", False),
     ("1,2,1,1;2,4,6", "Rows", True),
     ("2,3;1,1,1;4,5", "Columns", False),
+    ("1,1,1;3", "Columns", True),
+    ("1;2;1;1,2;4;6", "Columns", True),
 ]
 
 TOL = 1e-9
