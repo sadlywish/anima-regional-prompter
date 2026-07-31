@@ -323,30 +323,32 @@ masterpiece, best quality ADDCOMM 温暖的房间 ADDBASE 左边人物 BREAK 右
   （无 common 前缀 / 无 base 混合），不报错。这与 RP 一致，且是 x/y 图之类场景的常见状态。
 - `BREAK` / `ADDCOL` / `ADDROW`：区域分隔符，三者等价（本扩展的分区由 Divide ratio
   显式决定，RP 中三者的方向含义在此无差别）。
-- 分隔符必须大写，且**两侧不能紧邻 ASCII 字母或数字**：
+- 分隔符必须**大写**，**不做任何边界判定**，与 RP 完全一致——RP 用的是裸字符串操作
+  （`regions.py:124` 的 `s.split(kr)`、`regions.py:334` 的 `x.count(KEYBRK)`、
+  `rp.py:1012` 的 `replace(KEYBRK, ...)`）。任何紧邻写法一律照切：
 
-  ```
-  (?<![A-Za-z0-9])(?:ADDCOMM|ADDBASE|ADDCOL|ADDROW|BREAK)(?![A-Za-z0-9])
-  ```
+  | 写法 | 是否切分 |
+  |------|---------|
+  | `room ADDBASE girl` | 是 |
+  | `房间ADDBASE左边` | 是 |
+  | `room,ADDBASE,girl` | 是 |
+  | `dress BREAK1boy` | 是 |
+  | `dressBREAK1boy` | 是 |
+  | `BREAKFAST` | 是 → 空段 + `FAST` |
+  | 小写 `break` | 否（区分大小写） |
 
-  **不要用 `\b`。** `\b` 基于 `\w` 判定，而汉字属于 `\w`，于是 `房间ADDBASE左边`
+  **不得使用 `\b` 词边界。** `\b` 基于 `\w` 判定而汉字属于 `\w`，`房间ADDBASE左边`
   两侧都不构成词边界、整句不会被切分——对中英混排的提示词是致命的。
-  上式只排除西文字母数字，中文、标点、空格紧邻时均可正常切分。
 
-  | 写法 | 是否切分 | 说明 |
-  |------|---------|------|
-  | `room ADDBASE girl` | 是 | 常规写法 |
-  | `房间ADDBASE左边` | 是 | 中文紧邻，`\b` 方案在此失效 |
-  | `room,ADDBASE,girl` | 是 | 标点紧邻 |
-  | `BREAKFAST` | 否 | 字母紧邻，避免误伤单词 |
-  | `roomADDBASEgirl` | 否 | 字母紧邻 |
-
-  > **与 RP 的差异（有意为之）**：RP 完全不做边界判定，用的是裸字符串操作
-  > （`regions.py:124` 的 `s.split(kr)`、`regions.py:334` 的 `x.count(KEYBRK)`、
-  > `rp.py:1012` 的 `replace(KEYBRK, ...)`；源码里还留着一句 TODO 说想改成正则）。
-  > 因此 RP 会把 `BREAKFAST` 切成空段加 `FAST`。本实现是 RP 行为的**严格改进**：
-  > RP 能正确处理的全部能处理，额外修掉了这个误伤。唯一分歧是 `roomADDBASEgirl`
-  > 这类字母紧邻写法我们不切而 RP 切——而 RP 切完得到的也是碎句。
+  > **为什么不加边界加固。** 曾评估过「只排除紧邻的 ASCII 字母数字」这一折中方案，
+  > 它能保护 `BREAKFAST` 不被误伤。但 Danbooru 标签以数字开头是常态
+  > （`1girl` / `1boy` / `2girls`），于是 `BREAK1boy` 这类写法会**不被识别**，
+  > 进而使 `has_any_keyword` 返回 `False`、整个扩展静默不生效——用户拿到一张正常图
+  > 却不知道分区没起作用。这是本设计一贯避免的静默失败。
+  >
+  > 相反，不加边界时两种误判都是**响亮**的：粘连写法照常切分；`BREAKFAST` 被切出
+  > 空段则触发「第 N 段为空」的 `ValueError`。加之 Danbooru 标签一律小写、
+  > 匹配又区分大小写，大写 `BREAKFAST` 出现在提示词里的概率极低。
 - 每段去首尾空白与多余逗号。空的区域段抛错。
 
 ### 6.1 负面提示词
