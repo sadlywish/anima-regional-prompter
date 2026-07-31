@@ -189,12 +189,13 @@ class AnimaRegionalPrompter(scripts.Script):
         stacked = _pad_and_stack(conds)
 
         region_count = len(config.region_prompts)
+        region_contexts = stacked[:region_count]
         base_context = stacked[region_count:] if config.base_prompt else None
 
         self.config = config
         self.state = RPState(
             masks=torch.zeros(region_count, 1),   # 采样期按实际网格重建
-            region_contexts=stacked[:region_count],
+            region_contexts=region_contexts,
             base_context=base_context,
             base_weights=torch.tensor(config.base_weights),
         )
@@ -212,6 +213,13 @@ class AnimaRegionalPrompter(scripts.Script):
             joined = ", ".join(config.degradations)
             logger.warning(f"以下参数不受支持，已降级：{joined}")
             p.extra_generation_params["RP Unsupported"] = joined
+        if config.debug:
+            # 诊断只在 debug=True 时构建，默认路径零开销。写进
+            # extra_generation_params 是为了能从 API 返回的 infotext 里
+            # 取回，不依赖读 Forge 控制台（真机验证时后者不总是方便看）。
+            p.extra_generation_params.update(
+                _debug_generation_params(config, conds, region_contexts)
+            )
 
     def process_before_every_sampling(self, p, *args, **kwargs):
         if self.config is None or self.state is None:
@@ -225,8 +233,12 @@ class AnimaRegionalPrompter(scripts.Script):
         config = self.config
         state = self.state
         previous_wrapper = unet.model_options.get("model_function_wrapper")
+        # 每个采样阶段（base 一次、hires 二阶段再一次）只在第一步落一次诊断，
+        # 不随每个 denoise step 重复计算，避免即使在 debug=True 下也白白多花开销。
+        diag_written = False
 
         def wrapper(model_function, wrapper_kwargs):
+            nonlocal diag_written
             latent = wrapper_kwargs["input"]
             grid = (
                 math.ceil(latent.shape[2] / patch_temporal),
@@ -242,6 +254,19 @@ class AnimaRegionalPrompter(scripts.Script):
                 empties = empty_region_indices(state.masks)
                 if empties:
                     logger.warning(f"以下区域在 {grid} 网格上分不到 token：{empties}")
+                if not diag_written:
+                    diag_written = True
+                    # p 通过闭包可见，直接写回 extra_generation_params 即可，
+                    # 无需借道 RPState 或模块级变量中转。
+                    token_counts = " / ".join(
+                        f"{i}:{int(state.masks[i].sum().item())}"
+                        for i in range(state.masks.shape[0])
+                    )
+                    p.extra_generation_params.update({
+                        "RP Dbg Grid": _shape_str(grid),
+                        "RP Dbg Mask": _shape_str(state.masks.shape),
+                        "RP Dbg Tok": token_counts,
+                    })
             if previous_wrapper is not None:
                 return previous_wrapper(model_function, wrapper_kwargs)
             return model_function(
@@ -267,3 +292,49 @@ def _pad_and_stack(conds):
             cond = torch.cat([cond, tail], dim=0)
         padded.append(cond)
     return torch.stack(padded)
+
+
+def _sanitize(text: str) -> str:
+    """清理会与 PNG info 的逗号分隔符冲突的字符，仅用于调试片段。"""
+    return text.replace(",", "/").replace("\n", " ").replace("\r", " ")
+
+
+def _shape_str(shape) -> str:
+    """用 "x" 连接 shape 各维，避免 tuple 默认 repr 里的逗号污染 PNG info。"""
+    return "x".join(str(dim) for dim in shape)
+
+
+def _debug_generation_params(config, conds, region_contexts) -> dict:
+    """debug=True 时的运行期诊断，写进 extra_generation_params 以便从 API 返回
+    的 infotext 里回溯 process() 构建 region_contexts 这条链路。
+
+    真机复现过"区域内容错位"（某区域实际拿到了另一区域的 context）的问题，
+    这里刻意留了两组能直接定位该类问题的读数：
+    - RP Dbg Norm：若两个本该不同的区域范数完全相同，说明它们共享了同一份张量；
+    - RP Dbg Diff：任意两区域 context 的差值范数，某对为 0 就实锤了"这两个区域
+      用的是同一份 context"。
+
+    只在 config.debug 为真时被调用，默认路径不会产生这里的任何开销。
+    """
+    previews = " / ".join(
+        f"{i}:{_sanitize(text[:30])}" for i, text in enumerate(config.region_prompts)
+    )
+    cond_shapes = " / ".join(_shape_str(c.shape) for c in conds)
+
+    region_count = region_contexts.shape[0]
+    norms = " / ".join(
+        f"{i}:{region_contexts[i].norm().item():.2f}" for i in range(region_count)
+    )
+    diffs = " / ".join(
+        f"{i}-{j}:{(region_contexts[i] - region_contexts[j]).norm().item():.2f}"
+        for i in range(region_count)
+        for j in range(i + 1, region_count)
+    )
+
+    return {
+        "RP Dbg Segs": f"n={len(config.region_prompts)} | {previews}",
+        "RP Dbg Cond": f"n={len(conds)} | {cond_shapes}",
+        "RP Dbg Stack": _shape_str(region_contexts.shape),
+        "RP Dbg Norm": norms,
+        "RP Dbg Diff": diffs,
+    }

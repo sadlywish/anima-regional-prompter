@@ -250,3 +250,129 @@ class TestNormalConfig:
 
         assert p.extra_generation_params.get("RP Active") is True
         assert "RP Error" not in p.extra_generation_params
+
+
+def _make_fake_p_with_conds(prompt, conds_by_text):
+    """构造一个假的 `p`，各文本段返回各不相同的 cond，用来验证调试诊断里
+    范数/差值的具体数值（而不仅仅是键是否存在）。
+
+    与 `_make_fake_p` 的区别：后者对所有段返回同一份全零张量，无法区分
+    "两个区域碰巧都是 0" 与 "两个区域共享了同一份张量" 这两种情况。
+    """
+
+    def get_learned_conditioning(texts):
+        return [conds_by_text[text] for text in texts]
+
+    sd_model = types.SimpleNamespace(
+        forge_objects=types.SimpleNamespace(
+            unet=types.SimpleNamespace(
+                model=types.SimpleNamespace(diffusion_model=Anima())
+            )
+        ),
+        get_learned_conditioning=get_learned_conditioning,
+    )
+    return types.SimpleNamespace(
+        prompt=prompt,
+        negative_prompt="",
+        extra_generation_params={},
+        sd_model=sd_model,
+    )
+
+
+class _FakeUnet:
+    """process_before_every_sampling() 用到的最小 unet 替身。
+
+    只提供该方法实际调用到的接口：clone/model_options/
+    set_model_unet_function_wrapper/set_transformer_option，外加
+    `.wrapper` 属性方便测试事后取出被注册的闭包自行调用。
+    """
+
+    def __init__(self, diffusion_model):
+        self.model = types.SimpleNamespace(diffusion_model=diffusion_model)
+        self.model_options = {}
+        self.wrapper = None
+
+    def clone(self):
+        return self
+
+    def set_model_unet_function_wrapper(self, wrapper):
+        self.wrapper = wrapper
+
+    def set_transformer_option(self, key, value):
+        pass
+
+
+class TestDebugDiagnostics:
+    """debug=True 时应写入运行期诊断（真机验证「区域内容错位」bug 用），
+    debug=False 时不能有任何额外产出。"""
+
+    def test_debug_false_produces_no_diagnostic_keys(self, anima_module, stub_backend):
+        script = anima_module.AnimaRegionalPrompter()
+        p = _make_fake_p("a BREAK b BREAK c")  # 3 段
+        args = _make_args(active=True, debug=False, ratios="1,1,1", mmode="Columns")
+
+        script.process(p, *args)
+
+        assert not [k for k in p.extra_generation_params if k.startswith("RP Dbg")]
+
+    def test_debug_true_writes_process_time_diagnostics(self, anima_module, stub_backend):
+        script = anima_module.AnimaRegionalPrompter()
+        conds_by_text = {
+            "a": torch.zeros(4, 8),
+            "b": torch.ones(4, 8),
+            "c": torch.full((4, 8), 2.0),
+        }
+        p = _make_fake_p_with_conds("a BREAK b BREAK c", conds_by_text)
+        args = _make_args(active=True, debug=True, ratios="1,1,1", mmode="Columns")
+
+        script.process(p, *args)
+
+        assert p.extra_generation_params["RP Dbg Segs"] == "n=3 | 0:a / 1:b / 2:c"
+        assert p.extra_generation_params["RP Dbg Cond"] == "n=3 | 4x8 / 4x8 / 4x8"
+        assert p.extra_generation_params["RP Dbg Stack"] == "3x4x8"
+        # 三个区域的 cond 分别是全 0/全 1/全 2，范数各不相同，
+        # 若两个区域的范数意外相等就说明它们共享了同一份张量。
+        assert p.extra_generation_params["RP Dbg Norm"] == "0:0.00 / 1:5.66 / 2:11.31"
+        # 0-1 与 1-2 的差值相等（都是"相差全 1"），0-2 差值加倍，
+        # 任何一对意外读到 0.00 都说明对应两个区域内容混淆了。
+        # 遍历顺序是 (0,1) (0,2) (1,2)，与 _debug_generation_params 的双重循环一致。
+        assert p.extra_generation_params["RP Dbg Diff"] == "0-1:5.66 / 0-2:11.31 / 1-2:5.66"
+        # 采样阶段的诊断（grid/mask）此时还没发生，不应提前出现
+        assert "RP Dbg Grid" not in p.extra_generation_params
+        assert "RP Dbg Mask" not in p.extra_generation_params
+        assert "RP Dbg Tok" not in p.extra_generation_params
+
+    def test_debug_true_writes_sampling_time_diagnostics(self, anima_module, stub_backend):
+        script = anima_module.AnimaRegionalPrompter()
+        conds_by_text = {
+            "a": torch.zeros(4, 8),
+            "b": torch.ones(4, 8),
+            "c": torch.full((4, 8), 2.0),
+        }
+        p = _make_fake_p_with_conds("a BREAK b BREAK c", conds_by_text)
+        args = _make_args(active=True, debug=True, ratios="1,1,1", mmode="Columns")
+        script.process(p, *args)
+
+        diffusion_model = Anima()
+        diffusion_model.patch_spatial = 1
+        diffusion_model.patch_temporal = 1
+        p.sd_model.forge_objects.unet = _FakeUnet(diffusion_model)
+
+        script.process_before_every_sampling(p)
+
+        # 手动模拟一次采样期的 unet 前向：宽度 6、Columns 三等分，每区域恰好 2 个 token
+        latent = torch.zeros(1, 4, 1, 1, 6)
+        wrapper_kwargs = {
+            "input": latent,
+            "timestep": torch.zeros(1),
+            "c": {"transformer_options": {}},
+        }
+
+        def model_function(inp, timestep, **kwargs):
+            return inp
+
+        p.sd_model.forge_objects.unet.wrapper(model_function, wrapper_kwargs)
+
+        assert p.extra_generation_params["RP Dbg Grid"] == "1x1x6"
+        assert p.extra_generation_params["RP Dbg Mask"] == "3x6"
+        assert p.extra_generation_params["RP Dbg Tok"] == "0:2 / 1:2 / 2:2"
