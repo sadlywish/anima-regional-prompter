@@ -89,6 +89,32 @@ def test_has_any_keyword():
     assert has_any_keyword("BREAKFAST")
 
 
+# --- 大小写敏感性覆盖：test_lowercase_break_is_not_a_separator 只锁住了
+# _REGION_SPLIT_RE 这一条路径。下面三个测试分别锁住 HAS_KEYWORD_RE、
+# _COMMON_SPLIT_RE、_BASE_SPLIT_RE，防止将来有人手滑加上 re.IGNORECASE
+# 或改成 .lower() 比较而没有测试拦住。
+
+
+def test_has_any_keyword_is_case_sensitive():
+    # 输入只含小写 addcomm，不含任何其他大写关键字，专门锁住 HAS_KEYWORD_RE
+    assert not has_any_keyword("a addcomm b")
+
+
+def test_lowercase_addcomm_is_not_a_common_separator():
+    # 锁住 _COMMON_SPLIT_RE：小写 addcomm 不被当成 common 分隔符，
+    # 真正的区域分隔符用大写 BREAK 保证能正常切出两个区域
+    seg = split_prompt("a addcomm b BREAK c", usecom=True, usebase=False)
+    assert seg.common == ""
+    assert seg.regions == ("a addcomm b", "c")
+
+
+def test_lowercase_addbase_is_not_a_base_separator():
+    # 锁住 _BASE_SPLIT_RE：小写 addbase 不被当成 base 分隔符
+    seg = split_prompt("a addbase b BREAK c", usecom=False, usebase=True)
+    assert seg.base == ""
+    assert seg.regions == ("a addbase b", "c")
+
+
 def test_strip_negative_keywords():
     cleaned, changed = strip_negative_keywords("worst quality BREAK bad hands")
     assert cleaned == "worst quality, bad hands"
