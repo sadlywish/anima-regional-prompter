@@ -63,6 +63,36 @@ def test_dtype_and_device_respected():
     assert masks.dtype == torch.float16
 
 
+def test_center_sampling_locks_w_axis_boundary():
+    """token 归属判据是"中心点"而非"左上角"，用能锁住这条规则的边界来测。
+
+    `1,3` 配 W=5：分区边界在 x=0.25，0.25×5=1.25 不是整数，边界不落在网格线
+    上——中心采样 x=0.1,0.3,0.5,0.7,0.9 与角点采样 x=0.0,0.2,0.4,0.6,0.8 在
+    这个边界下分组结果不同，能区分两种采样规则（不像 `1,1` 配 W=4 那种边界
+    恰好落在网格线上的组合，两种规则结果相同，锁不住任何东西）。
+    中心采样下只有 x=0.1 这一列落在 region0，region0 应恰好拿到 1 列。
+    """
+    masks = build_masks(parse_layout("1,3", "Columns"), (1, 3, 5))
+    assert masks[0].sum().item() == 1 * 3
+    assert masks[1].sum().item() == 4 * 3
+    # 逐位锁死：h=3 行，每行都是 [region0, region1, region1, region1, region1]
+    assert masks[0].tolist() == [1, 0, 0, 0, 0] * 3
+    assert masks[1].tolist() == [0, 1, 1, 1, 1] * 3
+
+
+def test_center_sampling_locks_h_axis_boundary():
+    """纵向对称用例：`1,3` 配 Rows 模式、H=5，边界同样是 y=0.25，
+    0.25×5=1.25 非整数，能在 h 轴上区分中心采样与角点采样。
+    中心采样 y=0.1,0.3,0.5,0.7,0.9 下只有 y=0.1 这一行落在 region0（上）。
+    """
+    masks = build_masks(parse_layout("1,3", "Rows"), (1, 5, 3))
+    assert masks[0].sum().item() == 1 * 3
+    assert masks[1].sum().item() == 4 * 3
+    # 逐位锁死：h=5 行，第 0 行全属于 region0，其余 4 行全属于 region1
+    assert masks[0].tolist() == [1, 1, 1] + [0, 0, 0] * 4
+    assert masks[1].tolist() == [0, 0, 0] + [1, 1, 1] * 4
+
+
 def test_cache_returns_same_tensor_for_same_key():
     cache = MaskCache()
     rects = parse_layout("1,1", "Columns")
