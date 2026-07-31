@@ -213,12 +213,30 @@ RP 的 `flipper` 参数（UI 标签 `flip "," and ";"`）在解析前交换两�
 与 Divide ratio **同构的字符串**，逐区域给出 base 混合权重，默认 `"0.2"`。
 `fmap` 默认值为 0（RP `regions.py:373` 的 `ffloatd(0)`）。
 
-广播规则（RP `split_l2` 的 `basestruct` 行为）：值不足时**重复最后一个**填满，多余的忽略。
-故 `"0.2"` 对任意布局都展开成全区域 0.2。
+广播规则**完整复刻** RP `split_l2` 的 `basestruct` 分支（`regions.py:133-162`）。关键在于
+它是**逐带**进行的，不是把所有值摊平后全局广播：
 
-> **与 RP 的已知差异**：RP 还有一条「某行值过多时溢出到下一行」的规则。
-> 本实现不复刻该行为——它在 RP 里也属于意外语义。超出当前带 cell 数的值直接截断。
-> 此差异写入 README。
+- 逐带取值。当前带的取值数 **不足** 该带的 cell 数 → 重复该带自己的最后一个值填满
+- 当前带的取值数 **超出** 该带的 cell 数 → 截到该带长度，**余下的值溢出到下一带**继续消费
+- 带已经用完（`r >= len(basestruct)`）时，剩余的值全部丢弃
+
+故 `"0.2"` 对任意布局仍展开成全区域 0.2，但多带且带内数量不对齐时，逐带与全局摊平会给出
+不同结果。两个实测反例（对照 RP 真实源码运行得出）：
+
+```
+ratios      1,2,1,1;2,4,6        →  带1 = 3 区，带2 = 2 区
+
+baseratios  0.1,0.2;0.3,0.4      →  [0.1, 0.2, 0.2,  0.3, 0.4]
+                                       带1 不足，重复自己的 0.2
+
+baseratios  0.1,0.2,0.3,0.4;0.5  →  [0.1, 0.2, 0.3,  0.4, 0.4]
+                                       带1 装不下，0.4 溢到带2；";0.5" 因带用完而丢弃
+```
+
+> **决策变更（2026-07-31）**：本节此前记载「不复刻溢出到下一带，超出即截断」。
+> Task 4 的审查用 RP 源码跑出了上面第一个反例，证明**逐带 vs 全局摊平**的差异不止于溢出规则，
+> 常见写法就会踩到。既然迁移兼容是本项目的核心要求，改为完整复刻，并按 §11.2 的方式
+> 给 baseratios 也建立对照 RP 真实源码的一致性断言。
 
 解析结果是长度 N 的权重向量，与区域一一对应。
 
@@ -246,6 +264,18 @@ def parse_base_weights(baseratios: str, layout: list[Rect], mmode: str,
 在注入 `transformer_options` 之前完成。RP 在这里会静默补齐最后一段提示词
 （`regions.py:383-384`），导致「少写一个 BREAK 后画面莫名其妙」这类难以排查的问题。
 错误信息须包含实际区域数、实际段数、以及解析出的带/cell 结构。
+
+**这个 `ValueError` 不会一路传到用户面前。** `build_config()` 所在的 `lib_anima_rp/`
+是纯逻辑层，抛出异常是它唯一能做的正确的事；但 Forge 的 `modules/scripts.py`
+会用 `try/except Exception` 吞掉 `Script.process()` 抛出的一切异常（只在控制台打印
+一次 traceback，生成照常进行），扩展没有中止生成的能力。因此 `scripts/`
+边界层（`AnimaRegionalPrompter.process()`）必须捕获这个 `ValueError`，并降级为
+「本次生成不分区」：控制台警告一次、把错误信息写进
+`p.extra_generation_params["RP Error"]` 留痕、不写 `RP Active`（分区并未生效，
+写了会误导事后看图的人）、正常返回让生成继续。这是本项目「纯逻辑层抛
+`ValueError`，Forge 边界层捕获并转成警告 + PNG info 留痕 + 继续生成」这一整体
+错误处理策略的一个实例，与 mmode 非法、ratios 非法等情形的处理方式一致。
+详见 README「与 RP 的已知差异」一节。
 
 ## 5. 条件注入（conditioning.py）
 
@@ -305,8 +335,32 @@ masterpiece, best quality ADDCOMM 温暖的房间 ADDBASE 左边人物 BREAK 右
   （无 common 前缀 / 无 base 混合），不报错。这与 RP 一致，且是 x/y 图之类场景的常见状态。
 - `BREAK` / `ADDCOL` / `ADDROW`：区域分隔符，三者等价（本扩展的分区由 Divide ratio
   显式决定，RP 中三者的方向含义在此无差别）。
-- 分隔符必须大写且是独立词（正则 `\b(?:ADDCOMM|ADDBASE|ADDCOL|ADDROW|BREAK)\b`），
-  避免误伤含这些子串的单词。
+- 分隔符必须**大写**，**不做任何边界判定**，与 RP 完全一致——RP 用的是裸字符串操作
+  （`regions.py:124` 的 `s.split(kr)`、`regions.py:334` 的 `x.count(KEYBRK)`、
+  `rp.py:1012` 的 `replace(KEYBRK, ...)`）。任何紧邻写法一律照切：
+
+  | 写法 | 是否切分 |
+  |------|---------|
+  | `room ADDBASE girl` | 是 |
+  | `房间ADDBASE左边` | 是 |
+  | `room,ADDBASE,girl` | 是 |
+  | `dress BREAK1boy` | 是 |
+  | `dressBREAK1boy` | 是 |
+  | `BREAKFAST` | 是 → 空段 + `FAST` |
+  | 小写 `break` | 否（区分大小写） |
+
+  **不得使用 `\b` 词边界。** `\b` 基于 `\w` 判定而汉字属于 `\w`，`房间ADDBASE左边`
+  两侧都不构成词边界、整句不会被切分——对中英混排的提示词是致命的。
+
+  > **为什么不加边界加固。** 曾评估过「只排除紧邻的 ASCII 字母数字」这一折中方案，
+  > 它能保护 `BREAKFAST` 不被误伤。但 Danbooru 标签以数字开头是常态
+  > （`1girl` / `1boy` / `2girls`），于是 `BREAK1boy` 这类写法会**不被识别**，
+  > 进而使 `has_any_keyword` 返回 `False`、整个扩展静默不生效——用户拿到一张正常图
+  > 却不知道分区没起作用。这是本设计一贯避免的静默失败。
+  >
+  > 相反，不加边界时两种误判都是**响亮**的：粘连写法照常切分；`BREAKFAST` 被切出
+  > 空段则触发「第 N 段为空」的 `ValueError`。加之 Danbooru 标签一律小写、
+  > 匹配又区分大小写，大写 `BREAKFAST` 出现在提示词里的概率极低。
 - 每段去首尾空白与多余逗号。空的区域段抛错。
 
 ### 6.1 负面提示词

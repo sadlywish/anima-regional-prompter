@@ -550,7 +550,7 @@ git commit -m "feat(layout): support two-dimensional ratios with RP parity asser
 
 **Interfaces:**
 - Consumes: `parse_layout`（Task 2/3）
-- Produces: `parse_base_weights(baseratios: str, ratios: str, mmode: str, flipper: bool = False) -> list[float]`，返回长度等于区域数的权重列表
+- Produces: `parse_base_weights(baseratios: str, ratios: str, mmode: str) -> list[float]`，返回长度等于区域数的权重列表。**不接受 flipper 参数** —— RP 只对 ratios 应用 flipper，且区域数量与 flipper 无关
 
 - [ ] **Step 1: 写失败测试**
 
@@ -634,17 +634,15 @@ def _float_or_zero(text):
         return 0.0
 
 
-def parse_base_weights(
-    baseratios: str, ratios: str, mmode: str, flipper: bool = False
-) -> list[float]:
+def parse_base_weights(baseratios: str, ratios: str, mmode: str) -> list[float]:
     """把 Base ratio 字符串展开成与区域一一对应的权重列表。
 
     广播规则（RP split_l2 的 basestruct 行为）：值不足时重复最后一个，多余的截断。
-    注意 flipper 不作用于 baseratios，这与 RP rp.py:386 一致——它只对 aratios
-    调用 changecs。此处保留 flipper 参数仅为让调用方无需区分，内部不使用。
-    """
-    del flipper  # 有意不使用，见 docstring
 
+    **本函数不接受 flipper。** RP 在 rp.py:386 只对 aratios 调用 changecs，
+    baseratios 原样使用；而区域**数量**与 flipper 无关（交换分隔符只改变版面朝向）。
+    因此这里恒以 flipper=False 解析布局，只为取区域数量。
+    """
     region_count = len(parse_layout(ratios, mmode, flipper=False))
 
     raw = baseratios.strip()
@@ -1698,17 +1696,27 @@ def test_batch_rows_are_independent():
         assert torch.allclose(batched[row : row + 1], single, atol=TOL)
 
 
-def test_output_projection_can_be_hoisted():
-    """验证设计文档 §2.1 性质 3：output_proj 无 bias，故可从加权和中外提。"""
-    module, x, _ = make_case()
-    a = torch.randn(1, 12, module.n_heads * module.head_dim)
-    b = torch.randn(1, 12, module.n_heads * module.head_dim)
-    m1 = torch.rand(12).unsqueeze(0).unsqueeze(-1)
-    m2 = 1.0 - m1
+def test_anima_output_proj_has_no_bias():
+    """守护设计文档 §2.1 性质 3 所依赖的前提。
 
-    separate = m1 * module.output_proj(a) + m2 * module.output_proj(b)
-    hoisted = module.output_proj(m1 * a + m2 * b)
-    assert torch.allclose(separate, hoisted, atol=TOL)
+    regional_attention 把 output_proj 提到掩码加权和之外只做一次，
+    这只在 output_proj 无 bias 时成立。若上游把 Anima 的 SelfCrossAttention
+    改成带 bias，本断言先失败，而不是让分区结果悄悄偏移。
+
+    这里同时检查假模块与真实模块的定义保持一致。
+    """
+    import inspect
+
+    module, _, _ = make_case()
+    assert module.output_proj.bias is None
+
+    try:
+        from backend.nn.anima import SelfCrossAttention
+    except ImportError:
+        return  # 脱离 Forge 运行时只校验假模块
+
+    source = inspect.getsource(SelfCrossAttention.__init__)
+    assert "self.output_proj = nn.Linear(inner_dim, query_dim, bias=False)" in source
 ```
 
 - [ ] **Step 2: 运行测试确认失败**
@@ -2021,27 +2029,25 @@ git commit -m "feat(attention): route cond and uncond rows, patch SelfCrossAtten
 
 import logging
 import math
-import os
-import sys
 
 import gradio as gr
 import torch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from lib_anima_rp.attention import (  # noqa: E402
+# Forge 在 modules/scripts.py:505 就把每个扩展的根目录加进了 sys.path 并保留到
+# 会话结束，所以 lib_anima_rp 可以直接 import，无需自己动 sys.path。
+# 内置扩展 sd_forge_radial 用的也是这个方式。
+from lib_anima_rp.attention import (
     GRID_OPTION_KEY,
     TRANSFORMER_OPTION_KEY,
     RPState,
     patch_anima_attention,
 )
-from lib_anima_rp.layout import COLUMNS, ROWS, parse_layout  # noqa: E402
-from lib_anima_rp.masks import MaskCache, empty_region_indices  # noqa: E402
-from lib_anima_rp.prompts import strip_negative_keywords  # noqa: E402
-from lib_anima_rp.state import build_config, normalize_args  # noqa: E402
-
-from modules import scripts  # noqa: E402
-from modules.ui_components import InputAccordion  # noqa: E402
+from lib_anima_rp.layout import COLUMNS, ROWS, parse_layout
+from lib_anima_rp.masks import MaskCache, empty_region_indices
+from lib_anima_rp.prompts import strip_negative_keywords
+from lib_anima_rp.state import build_config, normalize_args
+from modules import scripts
+from modules.ui_components import InputAccordion
 
 logger = logging.getLogger("anima-rp")
 
