@@ -265,6 +265,18 @@ def parse_base_weights(baseratios: str, layout: list[Rect], mmode: str,
 （`regions.py:383-384`），导致「少写一个 BREAK 后画面莫名其妙」这类难以排查的问题。
 错误信息须包含实际区域数、实际段数、以及解析出的带/cell 结构。
 
+**这个 `ValueError` 不会一路传到用户面前。** `build_config()` 所在的 `lib_anima_rp/`
+是纯逻辑层，抛出异常是它唯一能做的正确的事；但 Forge 的 `modules/scripts.py`
+会用 `try/except Exception` 吞掉 `Script.process()` 抛出的一切异常（只在控制台打印
+一次 traceback，生成照常进行），扩展没有中止生成的能力。因此 `scripts/`
+边界层（`AnimaRegionalPrompter.process()`）必须捕获这个 `ValueError`，并降级为
+「本次生成不分区」：控制台警告一次、把错误信息写进
+`p.extra_generation_params["RP Error"]` 留痕、不写 `RP Active`（分区并未生效，
+写了会误导事后看图的人）、正常返回让生成继续。这是本项目「纯逻辑层抛
+`ValueError`，Forge 边界层捕获并转成警告 + PNG info 留痕 + 继续生成」这一整体
+错误处理策略的一个实例，与 mmode 非法、ratios 非法等情形的处理方式一致。
+详见 README「与 RP 的已知差异」一节。
+
 ## 5. 条件注入（conditioning.py）
 
 采用**旁路注入**：不改动 Forge 的提示词解析与批处理管道。

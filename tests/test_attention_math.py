@@ -284,6 +284,61 @@ def test_all_uncond_batch_delegates_entirely():
     assert torch.allclose(actual, module.reference_forward(x, negative), atol=TOL)
 
 
+class TestMaskShapeContract:
+    """C1（最终审查 Critical）：masks 的 token 维必须等于 x 的 token 维。
+
+    背景：`process()` 先塞一个 `(N, 1)` 的占位 masks，等采样期的 unet
+    function wrapper 拿到真实网格后写回。若那个 wrapper 没有运行（例如被
+    另一个不链式保留 model_function_wrapper 的扩展——Forge 内置的
+    sd_forge_spectrum 就是这样——覆盖掉），masks 会一直停留在 `(N, 1)`。
+
+    `(1, 1, 1)` 与 `(b, TOK, h*d)` 广播相乘是**合法**的 torch 操作，结果
+    恒为 0：所有正向行的 cross-attention 输出精确为 0，模型在没有任何文本
+    条件的情况下出图，且没有任何异常或警告。唯一的解法是在 regional_attention
+    开头就检查 masks 的 token 维是否与 x 一致，不一致就响亮报错，而不是让
+    它静默广播成全零。
+    """
+
+    def test_placeholder_mask_shape_raises_with_actionable_message(self):
+        module, x, contexts = make_case(regions=3)
+        # (N, 1) 占位形状——scripts/anima_regional_prompter.py:197 的
+        # torch.zeros(region_count, 1)，唯一能静默广播成全零的形状。
+        placeholder_masks = torch.zeros(3, 1)
+        state = RPState(
+            masks=placeholder_masks,
+            region_contexts=contexts,
+            base_context=None,
+            base_weights=torch.zeros(3),
+        )
+
+        with pytest.raises(Exception) as excinfo:
+            regional_attention(module, x, state, reference_attention_op)
+
+        message = str(excinfo.value)
+        # 必须包含：实际 masks 形状、期望的 token 数、以及指向根因（其他扩展
+        # 未链式保留 model_function_wrapper）的可定位说明。
+        assert "1" in message and "3" in message  # (3, 1) 的形状信息
+        assert str(x.shape[1]) in message  # 期望的 token 数
+        assert "wrapper" in message.lower() or "Spectrum" in message
+
+    def test_matching_mask_shape_does_not_raise(self):
+        module, x, contexts = make_case(regions=3)
+        tokens = x.shape[1]
+        masks = torch.zeros(3, tokens)
+        masks[0, : tokens // 3] = 1.0
+        masks[1, tokens // 3 : 2 * tokens // 3] = 1.0
+        masks[2, 2 * tokens // 3 :] = 1.0
+        state = RPState(
+            masks=masks,
+            region_contexts=contexts,
+            base_context=None,
+            base_weights=torch.zeros(3),
+        )
+
+        # 不应抛出：形状匹配是正常路径。
+        regional_attention(module, x, state, reference_attention_op)
+
+
 def test_missing_indices_treats_all_rows_as_cond():
     """transformer_options 里没有 cond_indices 时保守地把所有行当正向处理。"""
     from lib_anima_rp.attention import regional_forward

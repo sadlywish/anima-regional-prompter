@@ -48,6 +48,24 @@ def regional_attention(module, x, state: RPState, attention_op) -> torch.Tensor:
     q 只投影一次；每个区域只重算 k/v 与 attention；output_proj 因无 bias
     可以从加权和中外提，故只做一次。
     """
+    if state.masks.shape[1] != x.shape[1]:
+        # 采样期的 unet function wrapper（scripts/anima_regional_prompter.py 的
+        # process_before_every_sampling）负责把 process() 塞入的 (N, 1) 占位
+        # masks 重建成真实网格形状。若那个 wrapper 没有运行——例如另一个扩展
+        # 覆盖了 model_function_wrapper 却没有链式保留（Forge 内置的
+        # sd_forge_spectrum 就是这样，sorting_priority 排在本扩展之后）——
+        # masks 就会一直停留在 (N, 1)。(1, 1, 1) 与 (b, TOK, h*d) 的广播乘法
+        # 完全合法，结果恒为 0：所有正向行的 cross-attention 输出会静默变成
+        # 全零，模型在没有任何文本条件的情况下出图，没有任何异常或警告。
+        # 这里响亮报错，把静默错图变成一眼能定位根因的异常。
+        raise RuntimeError(
+            f"分区掩码形状不匹配：state.masks 形状为 {tuple(state.masks.shape)}，"
+            f"但当前图像 token 数为 {x.shape[1]}（masks 的第二维应等于该 token 数）。"
+            "这通常发生在采样期重建掩码的 unet function wrapper 没有运行——"
+            "很可能是另一个扩展覆盖了 model_function_wrapper 而没有链式保留；"
+            "请检查是否同时启用了 Spectrum 之类的扩展。"
+        )
+
     n_heads, head_dim = module.n_heads, module.head_dim
     batch = x.shape[0]
 

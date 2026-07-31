@@ -21,6 +21,7 @@
 """
 
 import importlib.util
+import logging
 import os
 import sys
 import types
@@ -174,12 +175,25 @@ def _make_args(**overrides):
     return tuple(params[name] for name in RP_ARG_NAMES)
 
 
-def _make_fake_p(prompt, *, negative_prompt="", boom_on_encode=False):
+def _make_fake_p(
+    prompt,
+    *,
+    negative_prompt="",
+    boom_on_encode=False,
+    all_prompts=None,
+    all_negative_prompts=None,
+    all_hr_negative_prompts=None,
+):
     """构造一个假的 `p` 对象，只提供 process() 用到的属性。
 
     `boom_on_encode=True` 用于错误路径测试：一旦真的走到了条件编码这一步，
     说明 build_config() 的异常没能在 is_anima() 之前被拦下，测试应当失败，
     而不是悄悄用假编码结果掩盖过去。
+
+    `all_prompts` / `all_negative_prompts` / `all_hr_negative_prompts` 默认不
+    设置在返回的 `p` 上（真实 Forge 里前两者恒存在、后者只在 hires 时存在）——
+    只有显式传入时才附加对应属性，让 `getattr(p, "...", None)` 的防御式读取
+    与真实环境的可选性保持一致。
     """
     if boom_on_encode:
         def get_learned_conditioning(texts):
@@ -196,12 +210,19 @@ def _make_fake_p(prompt, *, negative_prompt="", boom_on_encode=False):
         ),
         get_learned_conditioning=get_learned_conditioning,
     )
-    return types.SimpleNamespace(
+    p = types.SimpleNamespace(
         prompt=prompt,
         negative_prompt=negative_prompt,
         extra_generation_params={},
         sd_model=sd_model,
     )
+    if all_prompts is not None:
+        p.all_prompts = all_prompts
+    if all_negative_prompts is not None:
+        p.all_negative_prompts = all_negative_prompts
+    if all_hr_negative_prompts is not None:
+        p.all_hr_negative_prompts = all_hr_negative_prompts
+    return p
 
 
 class TestRegionPromptMismatch:
@@ -250,6 +271,98 @@ class TestNormalConfig:
 
         assert p.extra_generation_params.get("RP Active") is True
         assert "RP Error" not in p.extra_generation_params
+
+
+class TestSegmentationUsesAllPrompts:
+    """I2（最终审查 Important）：分段与门禁都必须读 p.all_prompts，而非 p.prompt。
+
+    背景：Forge 的 Styles 只作用于 `p.all_prompts`，不作用于 `p.prompt`
+    （modules/processing.py:406）。若关键字（典型是 BREAK）来自某个 Style，
+    `p.prompt` 里完全不含它，用 `p.prompt` 做门禁判定会让整个扩展静默不生效；
+    即使门禁侥幸通过，用 `p.prompt` 分段也会漏掉 Style 拼进来的内容。
+    """
+
+    def test_process_segments_from_all_prompts_not_prompt(self, anima_module, stub_backend):
+        script = anima_module.AnimaRegionalPrompter()
+        # p.prompt 故意不含任何分隔关键字，模拟关键字完全来自 Style、
+        # 只存在于 all_prompts 里的场景；若实现仍读 p.prompt 做门禁，
+        # has_any_keyword 会判定为 False，build_config 返回 None，
+        # RP Active 不会被设置。
+        p = _make_fake_p(
+            "plain prompt without any keyword",
+            all_prompts=["styled a BREAK styled b"],
+        )
+        args = _make_args(active=True, ratios="1,1", mmode="Columns")  # 2 区域
+
+        script.process(p, *args)
+
+        assert p.extra_generation_params.get("RP Active") is True
+        assert "RP Error" not in p.extra_generation_params
+        # 分段结果必须来自 all_prompts（含 Style 拼接的 "styled" 前缀），
+        # 而不是空的 p.prompt。
+        assert script.config.region_prompts == ("styled a", "styled b")
+
+    def test_process_falls_back_to_prompt_when_all_prompts_absent(self, anima_module, stub_backend):
+        """all_prompts 缺失（测试替身、或极端情况下的旧调用方）时仍能正常工作。"""
+        script = anima_module.AnimaRegionalPrompter()
+        p = _make_fake_p("a BREAK b")  # 不设置 all_prompts
+        args = _make_args(active=True, ratios="1,1", mmode="Columns")
+
+        script.process(p, *args)
+
+        assert p.extra_generation_params.get("RP Active") is True
+        assert script.config.region_prompts == ("a", "b")
+
+
+class TestNegativePromptStripping:
+    """I1（最终审查 Important）：负面提示词关键字剥离必须写进 Forge 真正读取的字段。
+
+    背景：Forge 在 process() 被调用之前就已经把 `all_negative_prompts` /
+    `all_hr_negative_prompts` 从 `negative_prompt` 展开好了
+    （modules/processing.py:398-407, 1584-1590），此后再无重新推导点。
+    只写 `p.negative_prompt` 会被完全忽略，用户负面提示词里的 BREAK/ADDCOMM
+    会原样作为字面文本进入 uncond 编码。
+    """
+
+    def test_all_negative_prompts_cleaned_in_every_item(self, anima_module, stub_backend):
+        script = anima_module.AnimaRegionalPrompter()
+        p = _make_fake_p(
+            "a BREAK b",
+            negative_prompt="bad BREAK worse",
+            all_negative_prompts=["bad BREAK worse", "bad BREAK worse"],
+        )
+        args = _make_args(active=True, ratios="1,1", mmode="Columns")
+
+        script.process(p, *args)
+
+        assert p.all_negative_prompts == ["bad, worse", "bad, worse"]
+
+    def test_all_hr_negative_prompts_cleaned_when_present(self, anima_module, stub_backend):
+        script = anima_module.AnimaRegionalPrompter()
+        p = _make_fake_p(
+            "a BREAK b",
+            negative_prompt="bad BREAK worse",
+            all_negative_prompts=["bad BREAK worse"],
+            all_hr_negative_prompts=["bad BREAK worse", "bad BREAK worse"],
+        )
+        args = _make_args(active=True, ratios="1,1", mmode="Columns")
+
+        script.process(p, *args)
+
+        assert p.all_hr_negative_prompts == ["bad, worse", "bad, worse"]
+
+    def test_no_keyword_leaves_all_negative_prompts_untouched(self, anima_module, stub_backend):
+        script = anima_module.AnimaRegionalPrompter()
+        p = _make_fake_p(
+            "a BREAK b",
+            negative_prompt="plain negative",
+            all_negative_prompts=["plain negative"],
+        )
+        args = _make_args(active=True, ratios="1,1", mmode="Columns")
+
+        script.process(p, *args)
+
+        assert p.all_negative_prompts == ["plain negative"]
 
 
 def _make_fake_p_with_conds(prompt, conds_by_text):
@@ -376,3 +489,80 @@ class TestDebugDiagnostics:
         assert p.extra_generation_params["RP Dbg Grid"] == "1x1x6"
         assert p.extra_generation_params["RP Dbg Mask"] == "3x6"
         assert p.extra_generation_params["RP Dbg Tok"] == "0:2 / 1:2 / 2:2"
+
+
+class TestEmptyRegionWarningUnconditional:
+    """I3（最终审查 Important）：区域分不到 token 的警告必须无条件发出，
+    不能被关在 debug=True 后面。
+
+    背景：设计文档 §8 要求这条警告无条件——某个区域分不到任何 token 意味着
+    用户写的那段提示词对画面完全没有影响，画面却仍然看起来正常，这正是本
+    项目反复强调要避免的静默失效。这里用一个极端偏斜的 Divide Ratio 在很窄
+    的网格上复现同样的效果，不必真的调大分辨率。
+    """
+
+    def test_empty_region_warns_even_when_debug_is_false(self, anima_module, stub_backend, caplog):
+        script = anima_module.AnimaRegionalPrompter()
+        p = _make_fake_p("a BREAK b")  # 2 段，匹配 2 区域
+        # ratios="1,999" 在只有 4 个横向 token 的网格上，第 0 区域
+        # （占比 1/1000）分不到任何 token。
+        args = _make_args(active=True, debug=False, ratios="1,999", mmode="Columns")
+        script.process(p, *args)
+
+        diffusion_model = Anima()
+        diffusion_model.patch_spatial = 1
+        diffusion_model.patch_temporal = 1
+        p.sd_model.forge_objects.unet = _FakeUnet(diffusion_model)
+        script.process_before_every_sampling(p)
+
+        latent = torch.zeros(1, 4, 1, 1, 4)
+        wrapper_kwargs = {
+            "input": latent,
+            "timestep": torch.zeros(1),
+            "c": {"transformer_options": {}},
+        }
+
+        def model_function(inp, timestep, **kwargs):
+            return inp
+
+        with caplog.at_level(logging.WARNING, logger="anima-rp"):
+            p.sd_model.forge_objects.unet.wrapper(model_function, wrapper_kwargs)
+
+        assert any("分不到 token" in record.getMessage() for record in caplog.records)
+        # debug=False 时仍不应该有诊断键（与 TestDebugDiagnostics 的约定一致），
+        # 空区域警告与 debug 专属诊断是两回事，不能因为前者无条件化就带出后者。
+        assert "RP Dbg Grid" not in p.extra_generation_params
+
+    def test_empty_region_warning_reported_only_once_per_sampling_stage(
+        self, anima_module, stub_backend, caplog
+    ):
+        """同一采样阶段的多个 denoise step 只应该报一次，复用现有的 diag_written。"""
+        script = anima_module.AnimaRegionalPrompter()
+        p = _make_fake_p("a BREAK b")
+        args = _make_args(active=True, debug=False, ratios="1,999", mmode="Columns")
+        script.process(p, *args)
+
+        diffusion_model = Anima()
+        diffusion_model.patch_spatial = 1
+        diffusion_model.patch_temporal = 1
+        p.sd_model.forge_objects.unet = _FakeUnet(diffusion_model)
+        script.process_before_every_sampling(p)
+
+        latent = torch.zeros(1, 4, 1, 1, 4)
+
+        def model_function(inp, timestep, **kwargs):
+            return inp
+
+        with caplog.at_level(logging.WARNING, logger="anima-rp"):
+            for _ in range(3):  # 模拟 3 个 denoise step
+                wrapper_kwargs = {
+                    "input": latent,
+                    "timestep": torch.zeros(1),
+                    "c": {"transformer_options": {}},
+                }
+                p.sd_model.forge_objects.unet.wrapper(model_function, wrapper_kwargs)
+
+        empty_region_warnings = [
+            record for record in caplog.records if "分不到 token" in record.getMessage()
+        ]
+        assert len(empty_region_warnings) == 1

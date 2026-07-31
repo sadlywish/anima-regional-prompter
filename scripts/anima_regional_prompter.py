@@ -60,6 +60,68 @@ def render_preview(ratios, mmode, flipper):
     )
 
 
+def _segmentation_text(p) -> str:
+    """取用于门禁判定（has_any_keyword）与分段（split_prompt）的文本。
+
+    必须读 `p.all_prompts[0]` 而非 `p.prompt`：Forge 的 Styles 只作用于
+    `all_prompts`（modules/processing.py:406），不作用于 `p.prompt`。若关键字
+    （典型是 BREAK）来自某个 Style，用 `p.prompt` 做门禁会让整个扩展静默
+    不生效；即使侥幸通过，用 `p.prompt` 分段也会漏掉 Style 拼进来的内容。
+    门禁与分段必须用同一份文本——两者用不同来源正是这类 bug 的温床。
+
+    `all_prompts` 理论上恒存在（Forge 在 `setup_prompts()` 里展开，早于
+    `process()`），这里仍用 getattr + 非空判断保护，兼容测试替身与极端调用方。
+    """
+    all_prompts = getattr(p, "all_prompts", None)
+    if all_prompts:
+        return all_prompts[0]
+    return p.prompt[0] if isinstance(p.prompt, list) else p.prompt
+
+
+def _strip_negative_prompts(p) -> bool:
+    """剥离负面提示词里的分隔关键字，写回 Forge 真正读取的字段。
+
+    Forge 在 process() 被调用之前就已经把 `all_negative_prompts` /
+    `all_hr_negative_prompts` 从 `negative_prompt` 展开好了
+    （modules/processing.py:398-407、1584-1590），此后再无重新推导点：只写
+    `p.negative_prompt` 会被完全忽略，用户负面提示词里的 BREAK/ADDCOMM 会
+    原样作为字面文本进入 uncond 编码。因此这里逐项处理 `all_negative_prompts`
+    （恒存在）与 `all_hr_negative_prompts`（只在启用 hires 时存在，用 getattr
+    保护），`p.negative_prompt` 仍然同步写入一份——无害，也照顾直接读它的调用方。
+
+    返回是否发生过剥离，供调用方决定是否警告（只警告一次）。
+    """
+    changed_any = False
+
+    all_negative_prompts = getattr(p, "all_negative_prompts", None)
+    if all_negative_prompts:
+        cleaned = []
+        for text in all_negative_prompts:
+            cleaned_text, changed = strip_negative_keywords(text)
+            cleaned.append(cleaned_text)
+            changed_any = changed_any or changed
+        p.all_negative_prompts = cleaned
+
+    all_hr_negative_prompts = getattr(p, "all_hr_negative_prompts", None)
+    if all_hr_negative_prompts:
+        cleaned = []
+        for text in all_hr_negative_prompts:
+            cleaned_text, changed = strip_negative_keywords(text)
+            cleaned.append(cleaned_text)
+            changed_any = changed_any or changed
+        p.all_hr_negative_prompts = cleaned
+
+    negative = p.negative_prompt[0] if isinstance(p.negative_prompt, list) else p.negative_prompt
+    cleaned_negative, changed = strip_negative_keywords(negative)
+    changed_any = changed_any or changed
+    if isinstance(p.negative_prompt, list):
+        p.negative_prompt = [cleaned_negative] * len(p.negative_prompt)
+    else:
+        p.negative_prompt = cleaned_negative
+
+    return changed_any
+
+
 def is_anima(p) -> bool:
     try:
         model = p.sd_model.forge_objects.unet.model.diffusion_model
@@ -142,7 +204,7 @@ class AnimaRegionalPrompter(scripts.Script):
         self.state = None
 
         params = normalize_args(args)
-        prompt = p.prompt[0] if isinstance(p.prompt, list) else p.prompt
+        prompt = _segmentation_text(p)
 
         try:
             config = build_config(params, prompt)
@@ -170,14 +232,8 @@ class AnimaRegionalPrompter(scripts.Script):
 
         patch_anima_attention()
 
-        negative = p.negative_prompt[0] if isinstance(p.negative_prompt, list) else p.negative_prompt
-        cleaned_negative, changed = strip_negative_keywords(negative)
-        if changed:
+        if _strip_negative_prompts(p):
             logger.warning("负面提示词不分区，已剥离其中的分隔关键字。")
-            if isinstance(p.negative_prompt, list):
-                p.negative_prompt = [cleaned_negative] * len(p.negative_prompt)
-            else:
-                p.negative_prompt = cleaned_negative
 
         texts = list(config.region_prompts)
         if config.base_prompt:
@@ -250,12 +306,16 @@ class AnimaRegionalPrompter(scripts.Script):
             state.masks = MASK_CACHE.get(
                 config.rects, grid, latent.device, latent.dtype
             )
-            if config.debug:
+            if not diag_written:
+                diag_written = True
+                # 空区域警告是无条件的：某个区域分不到任何 token，意味着用户
+                # 写的那段提示词对画面完全没有影响，而画面看上去仍然正常——
+                # 正是本项目反复强调要避免的静默失效，设计文档 §8 要求无条件
+                # 报告，不能关在 debug 开关后面。低分辨率配多区域很容易踩到。
                 empties = empty_region_indices(state.masks)
                 if empties:
                     logger.warning(f"以下区域在 {grid} 网格上分不到 token：{empties}")
-                if not diag_written:
-                    diag_written = True
+                if config.debug:
                     # p 通过闭包可见，直接写回 extra_generation_params 即可，
                     # 无需借道 RPState 或模块级变量中转。
                     token_counts = " / ".join(

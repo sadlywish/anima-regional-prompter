@@ -187,9 +187,14 @@ N=3  MAE=0.00      N=4  MAE=0.00      （MAE 为逐像素平均绝对差）
   之所以不是直接中止生成，是因为 Forge 的 `modules/scripts.py:846` 会吞掉扩展
   `process()` 抛出的异常并继续跑——中止不在扩展的能力范围内。所以退而求其次，
   让错误在产物里留下痕迹：出图时不会有 `RP Active`，只有 `RP Error`，事后可查。
-- `process()` 读的是 `p.prompt`。若调用方传入的是逐图不同的提示词列表（典型是
-  API 路径，网页 UI 不会），整批会共用第一张图的分区配置。上游 RP 的
-  `rp.py:358` 是同一行代码，此处为忠实复刻而非新引入的问题。
+- `process()` 分段与门禁判定读的是 `p.all_prompts[0]`（`p.all_prompts` 缺失时
+  回退到 `p.prompt`）。若调用方传入的是逐图不同的提示词列表（典型是 API
+  路径，网页 UI 不会），整批会共用第一张图的分区配置。
+
+  之所以不能读 `p.prompt`：Forge 的 Styles 只作用于 `p.all_prompts`，不作用于
+  `p.prompt`（`modules/processing.py:406`）。若用户选了任何一个 Style，
+  用 `p.prompt` 做门禁判定或分段都会漏掉 Style 拼进来的内容，甚至可能因为
+  分隔关键字恰好来自 Style 而让整个扩展静默不生效。
 
 ## 安装
 
