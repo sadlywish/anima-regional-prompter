@@ -30,6 +30,15 @@ CASES = [
     ("1,1,1,1", "Columns", False),
     ("1,1,1;2,2", "Columns", False),
     ("1,2,1;2,3,1", "Rows", False),
+    # 修复轮 4：这五条是 tests/test_base_weights_rp_parity.py 里
+    # flipper=True 的用例用到、但此前没有独立对照的形状（团队复审报告里
+    # "长度契约破裂"的原始 5 个反例）。flipper 会交换 ratios 里的 ';' 与
+    # ','，彻底改变带/单元结构乃至区域总数，必须单独验证。
+    ("1,2;3,4", "Columns", True),
+    ("1,2,1,1;2,4,6", "Columns", True),
+    ("2,3;1,1,1;4,5", "Columns", True),
+    ("1,1", "Rows", True),
+    ("1,2,3", "Rows", True),
 ]
 
 TOL = 1e-9

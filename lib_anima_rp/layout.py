@@ -128,7 +128,9 @@ def _float_or_zero(text):
         return 0.0
 
 
-def parse_base_weights(baseratios: str, ratios: str, mmode: str) -> list[float]:
+def parse_base_weights(
+    baseratios: str, ratios: str, mmode: str, flipper: bool = False
+) -> list[float]:
     """把 Base ratio 字符串展开成与区域一一对应的权重列表。
 
     完整复刻 RP regions.py:133-162 的 split_l2(basestruct=...) 分支，对应
@@ -148,22 +150,33 @@ def parse_base_weights(baseratios: str, ratios: str, mmode: str) -> list[float]:
     - 带索引越界（所有带都已填满）→ 剩余的值全部丢弃
     - 所有输入段处理完后仍有带未填充 → 用最后一次出现的取值重复填满剩余带
 
-    **本函数不接受 flipper。** RP 在 rp.py:386 只对 aratios 调用 changecs，
-    baseratios 原样使用，这与 flipper 开关完全无关。
+    **`flipper` 影响区域结构，但不影响 baseratios 字符串本身怎么切**（修复轮 4，
+    纠正此前"区域数量与 flipper 无关"的错误结论）。RP `rp.py:386` 的
+    `if flipper: aratios = changecs(aratios)` 发生在 matrixdealer **之前**，
+    传进 matrixdealer 的 aratios 已经是交换过 ';'/',' 的版本，`basestruct` 的形状
+    （`lbreaks`）就是从这个翻转后的结构推出来的——所以交换分隔符会重新划分带/单元，
+    连区域**总数**都可能改变。而 `bratios`（baseratios）字符串自身从未被
+    `changecs` 处理过，`split_l2(bratios, ...)` 用的还是原始的 ';'/','。
+    因此这里对 `ratios` 应用 flipper 来算区域结构（与 `parse_layout` 保持一致），
+    但 `baseratios` 字符串本身照旧不翻转。
 
-    但 **mmode（Rows/Columns）确实会影响 baseratios 自身的分隔符角色**：
-    RP 对 bratios 的 split_l2 调用同样传入 indflip = ("Ver" in mode)，
-    即 mmode 为 Rows 时会交换 ';' 与 ',' 的行/列语义——这是 mmode 参数本身
-    的行为，与 aratios 的处理完全对称，和 flipper 开关是两回事。
+    另外，**mmode（Rows/Columns）仍然会影响 baseratios 自身的分隔符角色**，
+    这与 flipper 无关：RP 对 bratios 的 split_l2 调用同样传入
+    indflip = ("Ver" in mode)，即 mmode 为 Rows 时会交换 ';' 与 ',' 的行/列
+    语义——这是 mmode 参数本身的行为，与 aratios 的处理完全对称。
     """
     if mmode not in VALID_MMODES:
         raise ValueError(f"未知的 mmode：{mmode!r}，只接受 {VALID_MMODES}")
 
-    # 1. 计算区域的带/单元结构（形状）。与 parse_layout 共用 _parse_ratio_structure，
-    #    保证对非法 ratios（负数、非数字、空串、只有分隔符等）的校验行为完全一致，
-    #    不会像此前那样因为各自重写一遍分支判断而在某一分支上分叉
-    #    （此前二维分支复用 _split_bands 会校验，一维分支自己重写却完全不校验）。
-    _, cell_rows = _parse_ratio_structure(ratios, mmode)
+    # 1. 计算区域的带/单元结构（形状）。flipper 应用在 ratios 上，与 parse_layout
+    #    的处理完全一致（先 strip，flipper 时 swap_delimiters，再解析结构），
+    #    因为 RP 的 basestruct 形状本来就是从翻转后的 aratios 推出来的。
+    #    与 parse_layout 共用 _parse_ratio_structure，保证对非法 ratios（负数、
+    #    非数字、空串、只有分隔符等）的校验行为完全一致。
+    text = ratios.strip()
+    if flipper:
+        text = swap_delimiters(text)
+    _, cell_rows = _parse_ratio_structure(text, mmode)
     cell_rows_shape = [len(row) for row in cell_rows]
 
     # 2. baseratios 自身的行/列分隔符角色由 mmode 决定（对应 RP 的 indflip）

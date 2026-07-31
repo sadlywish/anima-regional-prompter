@@ -122,3 +122,64 @@ def test_invalid_ratios_raises_for_2d():
     # 确保重构后二维分支的校验行为不受影响。
     with pytest.raises(ValueError):
         parse_base_weights("0.2", "1,2,1,1;2,-4,6", "Columns")
+
+
+def test_flipper_changes_region_structure_and_weight_alignment():
+    # 修复轮 4：flipper=True 会交换 ratios 里的 ';' 与 ','，彻底改变带/单元结构，
+    # 区域**数量**也会随之改变——此前 docstring 里"区域数量与 flipper 无关"的说法
+    # 是错的。以下 5 个用例取自团队复审报告，取值已对照 RP 真实 split_l2 逐一验证：
+    #   flipper 应用于 ratios（决定 basestruct 的形状），
+    #   但 baseratios 字符串本身从不翻转（RP 从未对 bratios 调用 changecs）。
+    assert_weights(
+        parse_base_weights("0.1,0.2", "1,2;3,4", "Columns", flipper=True),
+        [0.1, 0.2, 0.2],
+    )
+    assert_weights(
+        parse_base_weights(
+            "0.1,0.2,0.3,0.4,0.5", "1,2,1,1;2,4,6", "Columns", flipper=True
+        ),
+        [0.1, 0.2, 0.3, 0.4, 0.5, 0.5],
+    )
+    assert_weights(
+        parse_base_weights("0.1,0.2,0.3,0.4", "2,3;1,1,1;4,5", "Columns", flipper=True),
+        [0.1, 0.2, 0.3, 0.4, 0.4],
+    )
+    assert_weights(
+        parse_base_weights("0.2", "1,1", "Rows", flipper=True),
+        [0.2],
+    )
+    assert_weights(
+        parse_base_weights("0.1,0.2", "1,2,3", "Rows", flipper=True),
+        [0.1, 0.1],
+    )
+
+
+def test_flipper_defaults_to_false():
+    # 新增的 flipper 形参必须向后兼容：不传时行为与此前完全一致。
+    assert_weights(
+        parse_base_weights("0.1,0.2,0.3", "1,1,1", "Columns"),
+        parse_base_weights("0.1,0.2,0.3", "1,1,1", "Columns", flipper=False),
+    )
+
+
+def test_flipper_weight_count_matches_layout_region_count():
+    # 长度契约：无论 flipper 取何值，parse_base_weights 的返回长度必须等于
+    # parse_layout 用同样的 (ratios, mmode, flipper) 独立算出的区域数。
+    from lib_anima_rp.layout import parse_layout
+
+    combos = [
+        ("1,2;3,4", "Columns", True),
+        ("1,2,1,1;2,4,6", "Columns", True),
+        ("2,3;1,1,1;4,5", "Columns", True),
+        ("1,1", "Rows", True),
+        ("1,2,3", "Rows", True),
+        ("1,2,1,1;2,4,6", "Columns", False),
+        ("1,1,1", "Rows", False),
+    ]
+    for ratios, mmode, flipper in combos:
+        region_count = len(parse_layout(ratios, mmode, flipper))
+        weight_count = len(parse_base_weights("0.2", ratios, mmode, flipper))
+        assert weight_count == region_count, (
+            f"{ratios!r}/{mmode}/flip={flipper} 权重数 {weight_count} 与区域数 "
+            f"{region_count} 不符"
+        )
