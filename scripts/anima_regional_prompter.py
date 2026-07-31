@@ -144,7 +144,19 @@ class AnimaRegionalPrompter(scripts.Script):
         params = normalize_args(args)
         prompt = p.prompt[0] if isinstance(p.prompt, list) else p.prompt
 
-        config = build_config(params, prompt)
+        try:
+            config = build_config(params, prompt)
+        except ValueError as exc:
+            # build_config() 用「响亮报错」而非静默补齐来防止分区悄悄失效，
+            # 但 Forge 的 scripts.py process() 会吞掉脚本抛出的异常（只在控制台
+            # 打印 traceback，生成照常进行）：调用方（含 API）拿到的仍是一张
+            # 没有分区的图，且从 HTTP 响应完全看不出发生过什么。这里主动把
+            # 错误落进 extra_generation_params，让"生成继续、但产物留痕"，
+            # 而不是让 traceback 消失在没人看的控制台里；同时不写 RP Active，
+            # 因为分区并未生效，写了会误导事后看图的人。
+            logger.warning(f"ANIMA Regional Prompter 配置错误，本次生成不分区：{exc}")
+            p.extra_generation_params["RP Error"] = str(exc)
+            return
         if config is None:
             return
 
