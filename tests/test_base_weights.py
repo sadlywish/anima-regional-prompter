@@ -156,9 +156,82 @@ def test_flipper_changes_region_structure_and_weight_alignment():
 
 def test_flipper_defaults_to_false():
     # 新增的 flipper 形参必须向后兼容：不传时行为与此前完全一致。
+    #
+    # 挑例子的标准：flipper=False 与 flipper=True 的**展平结果必须不同**，
+    # 不能只是带结构不同——上一版用的是 ("0.1,0.2,0.3", "1,1,1")，翻转前后带
+    # 结构确实不同（[3] vs [1,1,1]），但展平出来的权重列表碰巧都是
+    # [0.1, 0.2, 0.3]，所以默认值就算被错改成 True 这条测试也不会红，
+    # 是一条锁不住自己名字所声称的东西的测试。
+    #
+    # "1,2;3,4" + Columns：flip=False 是 2 带各 1 单元（2 区域），
+    # flip=True 是 3 带各 1 单元（3 区域）——长度和取值都不同：
+    #   flip=False -> [0.1, 0.2]
+    #   flip=True  -> [0.1, 0.2, 0.2]
+    # 已验证：把默认值改成 True 后，下面两条断言都会因长度不符而变红。
+    assert_weights(parse_base_weights("0.1,0.2", "1,2;3,4", "Columns"), [0.1, 0.2])
     assert_weights(
-        parse_base_weights("0.1,0.2,0.3", "1,1,1", "Columns"),
-        parse_base_weights("0.1,0.2,0.3", "1,1,1", "Columns", flipper=False),
+        parse_base_weights("0.1,0.2", "1,2;3,4", "Columns", flipper=False),
+        [0.1, 0.2],
+    )
+
+
+def test_flipper_does_not_flip_base_ratios_string_columns():
+    # 专门守住"flipper 被错误地也应用到 baseratios 字符串本身"这个方向的回归
+    # （这是修复轮 4 改动里最容易搞反的地方：baseratios 只应该受 ratios 翻转后的
+    # 结构影响，字符串本身永远不翻转）。
+    #
+    # 挑选标准：baseratios 同时含 ',' 和 ';'，且 ratios 翻转后的带结构**不是**
+    # "每带一个单元"的退化形态——这样交换 baseratios 的分隔符才会真正改变逐带
+    # 消费方式，而不是"误翻转对它是空操作"。
+    #
+    # ratios="1;2;3,4;5" 在 Columns + flipper=True 下翻转成 "1,2,3;4,5"：
+    # 带 1 有 2 个单元、带 2 有 1 个单元（shape=[2, 1]，带 1 不是退化的单单元带）。
+    # baseratios="0.1,0.2;0.3" 若未被翻转，按 ';' 切成 ["0.1,0.2", "0.3"]，
+    # 恰好对应两带 -> [0.1, 0.2, 0.3]。
+    # 若 baseratios 被错误地也翻转成 "0.1;0.2,0.3"，则变成三段 ["0.1","0.2","0.3"]，
+    # 第一段填不满带 1（2 单元）会重复自己 -> [0.1, 0.1, 0.2]（第三段因带用完被丢弃）。
+    # 已验证：临时让实现也翻转 baseratios 字符串后，本测试会变红（结果变成
+    # [0.1, 0.1, 0.2]，与断言的 [0.1, 0.2, 0.3] 不符）。
+    assert_weights(
+        parse_base_weights("0.1,0.2;0.3", "1;2;3,4;5", "Columns", flipper=True),
+        [0.1, 0.2, 0.3],
+    )
+
+
+def test_flipper_does_not_flip_base_ratios_string_rows_underfill():
+    # 同上，换一组 Rows 模式、"带内不足"路径的例子，避免上面那条测试的巧合
+    # （例如碰巧不经过溢出分支）掩盖住其他子路径上的同类错误。
+    #
+    # ratios="3,2,2;2,5" 在 Rows + flipper=True 下翻转成 "3;2;2,2;5"：
+    # 带 1 有 2 个单元、带 2 有 1 个单元（shape=[2, 1]）。
+    # baseratios="0.55;0.90,0.83" 若未被翻转，按 Rows 模式自身的分隔符角色
+    # （','当行分隔符）切成 ["0.55;0.90", "0.83"]，恰好对应两带
+    # -> [0.55, 0.90, 0.83]。
+    # 若被错误地也翻转成 "0.55,0.90;0.83"，切成 ["0.55", "0.90;0.83"]，
+    # 第一段填不满带 1（2 单元）会重复自己 -> [0.55, 0.55, 0.90]（第二段溢出的
+    # 0.83 因带用完被丢弃）。
+    # 已验证：临时让实现也翻转 baseratios 字符串后，本测试会变红。
+    assert_weights(
+        parse_base_weights("0.55;0.90,0.83", "3,2,2;2,5", "Rows", flipper=True),
+        [0.55, 0.90, 0.83],
+    )
+
+
+def test_flipper_does_not_flip_base_ratios_string_rows_overfill():
+    # 再换一组 shape=[1, 2]（带 1 单元、带 2 双元，与上一条的 [2, 1] 相反）的
+    # Rows 例子，进一步扩大这个不变量的检测面，不让它压在单一形状上。
+    #
+    # ratios="5,5;2,4,4" 在 Rows + flipper=True 下翻转成 "5;5,2;4;4"：
+    # 带 1 有 1 个单元、带 2 有 2 个单元（shape=[1, 2]）。
+    # baseratios="0.65;0.73,0.37" 若未被翻转，切成 ["0.65;0.73", "0.37"]；
+    # 第一段 2 个值但带 1 只要 1 个，截断后 0.73 溢出到带 2（带 2 需要 2 个单元，
+    # 重复 0.73 补齐）-> [0.65, 0.73, 0.73]（第二段 0.37 因带用完被丢弃）。
+    # 若被错误地也翻转成 "0.65,0.73;0.37"，切成 ["0.65", "0.73;0.37"]，
+    # 恰好各自对应一带 -> [0.65, 0.73, 0.37]。
+    # 已验证：临时让实现也翻转 baseratios 字符串后，本测试会变红。
+    assert_weights(
+        parse_base_weights("0.65;0.73,0.37", "5,5;2,4,4", "Rows", flipper=True),
+        [0.65, 0.73, 0.73],
     )
 
 
