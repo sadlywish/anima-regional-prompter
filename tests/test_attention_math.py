@@ -161,6 +161,29 @@ def test_per_region_base_weights_interpolate():
     assert torch.allclose(actual[:, tokens // 2 :], pure_base[:, tokens // 2 :], atol=TOL)
 
 
+def test_single_region_full_coverage_with_batch_gt_1():
+    """batch>1 时单区域全覆盖，掩码广播必须对齐 token 维而非批次维。
+
+    覆盖空白：test_single_region_equals_plain_attention 用 batch=1、掩码全 1，
+    若把 regional_attention 里 masks[i].view(1, -1, 1) 误写成 view(-1, 1, 1)，
+    batch=1 时 attended 的批次维（1）会被广播吃掉，恰好与预期值逐元素相同，
+    torch.allclose 因此“意外通过”而发现不了这个错误。batch>1 时批次维不再是
+    1，这种误写要么导致形状不可广播直接报错，要么产生明显偏差的结果，
+    从而真正验证掩码的广播维度写对了。
+    """
+    module, x, contexts = make_case(regions=1, batch=3)
+    masks = torch.ones(1, x.shape[1])
+    state = RPState(
+        masks=masks,
+        region_contexts=contexts,
+        base_context=None,
+        base_weights=torch.zeros(1),
+    )
+    actual = regional_attention(module, x, state, reference_attention_op)
+    expected = module.reference_forward(x, contexts[0].unsqueeze(0))
+    assert torch.allclose(actual, expected, atol=TOL)
+
+
 def test_batch_rows_are_independent():
     module, x, contexts = make_case(regions=2, batch=3)
     tokens = x.shape[1]
@@ -206,3 +229,75 @@ def test_anima_output_proj_has_no_bias():
         source = f.read()
 
     assert "self.output_proj = nn.Linear(inner_dim, query_dim, bias=False)" in source
+
+
+def test_uncond_rows_use_original_path():
+    """混合 batch 中负向行必须走原路径，正向行走分区路径。"""
+    from lib_anima_rp.attention import regional_forward
+
+    module, x, contexts = make_case(regions=2, batch=4)
+    tokens = x.shape[1]
+    masks = torch.zeros(2, tokens)
+    masks[0, : tokens // 2] = 1.0
+    masks[1, tokens // 2 :] = 1.0
+    state = RPState(masks, contexts, None, torch.zeros(2))
+
+    negative = torch.randn(4, 5, 24)
+    options = {"cond_indices": [0, 1], "uncond_indices": [2, 3]}
+
+    def orig_forward(mod, xx, ctx, rope_emb=None, transformer_options=None):
+        return mod.reference_forward(xx, ctx)
+
+    actual = regional_forward(
+        module, x, negative, None, options, state, reference_attention_op, orig_forward
+    )
+
+    expected_cond = regional_attention(
+        module, x[[0, 1]], state, reference_attention_op
+    )
+    expected_uncond = module.reference_forward(x[[2, 3]], negative[[2, 3]])
+
+    assert torch.allclose(actual[[0, 1]], expected_cond, atol=TOL)
+    assert torch.allclose(actual[[2, 3]], expected_uncond, atol=TOL)
+
+
+def test_all_uncond_batch_delegates_entirely():
+    from lib_anima_rp.attention import regional_forward
+
+    module, x, contexts = make_case(regions=2, batch=2)
+    masks = torch.zeros(2, x.shape[1])
+    masks[0, :] = 1.0
+    state = RPState(masks, contexts, None, torch.zeros(2))
+    negative = torch.randn(2, 5, 24)
+    options = {"cond_indices": [], "uncond_indices": [0, 1]}
+
+    calls = []
+
+    def orig_forward(mod, xx, ctx, rope_emb=None, transformer_options=None):
+        calls.append(xx.shape[0])
+        return mod.reference_forward(xx, ctx)
+
+    actual = regional_forward(
+        module, x, negative, None, options, state, reference_attention_op, orig_forward
+    )
+    assert calls == [2], "纯 uncond 批应当一次性委托，而不是逐行处理"
+    assert torch.allclose(actual, module.reference_forward(x, negative), atol=TOL)
+
+
+def test_missing_indices_treats_all_rows_as_cond():
+    """transformer_options 里没有 cond_indices 时保守地把所有行当正向处理。"""
+    from lib_anima_rp.attention import regional_forward
+
+    module, x, contexts = make_case(regions=1, batch=2)
+    masks = torch.ones(1, x.shape[1])
+    state = RPState(masks, contexts, None, torch.zeros(1))
+
+    def orig_forward(mod, xx, ctx, rope_emb=None, transformer_options=None):
+        raise AssertionError("不应走原路径")
+
+    actual = regional_forward(
+        module, x, torch.randn(2, 5, 24), None, {}, state,
+        reference_attention_op, orig_forward,
+    )
+    expected = regional_attention(module, x, state, reference_attention_op)
+    assert torch.allclose(actual, expected, atol=TOL)

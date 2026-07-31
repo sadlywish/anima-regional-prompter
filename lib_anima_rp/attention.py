@@ -79,3 +79,101 @@ def regional_attention(module, x, state: RPState, attention_op) -> torch.Tensor:
         acc = (1.0 - weight_map) * acc + weight_map * base_attended
 
     return module.output_proj(acc)
+
+
+TRANSFORMER_OPTION_KEY = "anima_rp"
+GRID_OPTION_KEY = "anima_rp_grid"
+
+_PATCHED = False
+_ORIG_FORWARD = None
+
+
+def regional_forward(
+    module, x, context, rope_emb, transformer_options, state, attention_op, orig_forward
+) -> torch.Tensor:
+    """按 cond/uncond 分流：正向行走分区注意力，负向行走原始（不分区）路径。
+
+    Forge 采样时会把正向、负向条件拼在同一个 batch 里前向，
+    transformer_options 里的 cond_indices / uncond_indices（来自
+    backend/sampling/sampling_function.py 的 compute_cond_indices）标出
+    哪些行是正向、哪些是负向。负向提示词不分区，直接用传入的 context
+    交给原实现处理。
+
+    output_proj 只在两条路径里各作用一次：regional_attention 内部已经
+    做过投影，orig_forward 自带投影，这里不再重复投影。
+    """
+    options = transformer_options or {}
+    cond_indices = options.get("cond_indices")
+    uncond_indices = options.get("uncond_indices")
+
+    # 两个键都缺失：无法区分正负向，保守地把全部行当正向处理
+    if cond_indices is None and uncond_indices is None:
+        return regional_attention(module, x, state, attention_op)
+
+    cond_indices = list(cond_indices or [])
+    uncond_indices = list(uncond_indices or [])
+
+    if not cond_indices:
+        # 纯负向批：一次性委托给原实现，不逐行处理
+        return orig_forward(module, x, context, rope_emb, transformer_options)
+
+    if not uncond_indices:
+        # 纯正向批：全部行走分区路径
+        return regional_attention(module, x, state, attention_op)
+
+    out = torch.empty(
+        x.shape[0], x.shape[1], module.output_proj.out_features,
+        device=x.device, dtype=x.dtype,
+    )
+    out[cond_indices] = regional_attention(module, x[cond_indices], state, attention_op)
+    out[uncond_indices] = orig_forward(
+        module, x[uncond_indices], context[uncond_indices], rope_emb, transformer_options
+    )
+    return out
+
+
+def patch_anima_attention() -> None:
+    """给 backend.nn.anima.SelfCrossAttention.forward 打补丁，接入分区注意力。
+
+    幂等：重复调用只生效一次。补丁后的 forward 未启用分区（transformer_options
+    里没有 TRANSFORMER_OPTION_KEY）、self-attn、或 context 为 None 时，
+    只做一次 dict 查找就委托回原始 forward，self-attn、非 ANIMA 模型、
+    其他扩展的生成流程完全不受影响。
+
+    Forge 的 import 放在函数体内部：lib_anima_rp/ 顶层不得依赖 Forge，
+    只有真正调用本函数时才会触发这些 import，跑单元测试时不会命中。
+    """
+    global _PATCHED, _ORIG_FORWARD
+    if _PATCHED:
+        return
+
+    from backend.attention import attention_function
+    from backend.nn.anima import SelfCrossAttention
+
+    _ORIG_FORWARD = SelfCrossAttention.forward
+
+    def patched_forward(self, x, context=None, rope_emb=None, transformer_options=None):
+        state = (transformer_options or {}).get(TRANSFORMER_OPTION_KEY)
+        if state is None or self.is_SelfAttn or context is None:
+            return _ORIG_FORWARD(self, x, context, rope_emb, transformer_options)
+
+        def anima_attention_op(q, k, v):
+            # 与真实 SelfCrossAttention.torch_attention_op 语义一致：
+            # (b, s, h, d) -> (b, h, s, d) 后交给 attention_function；
+            # skip_reshape=True 表示输入已是 (b, h, s, d)，默认
+            # skip_output_reshape=False 时返回 (b, s, h*d)，正好满足
+            # regional_attention 对 attention_op 的契约。
+            # transformer_options 顺手透传：真实实现也会传（虽然目前各
+            # attention_function 后端都用 **kwargs 吞掉、不会用到它）。
+            return attention_function(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                q.shape[2], skip_reshape=True, transformer_options=transformer_options,
+            )
+
+        return regional_forward(
+            self, x, context, rope_emb, transformer_options, state,
+            anima_attention_op, _ORIG_FORWARD,
+        )
+
+    SelfCrossAttention.forward = patched_forward
+    _PATCHED = True
