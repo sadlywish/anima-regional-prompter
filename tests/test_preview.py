@@ -87,6 +87,49 @@ def _region_count(html: str) -> int:
     return len(re.findall(r"position:absolute", html))
 
 
+# 匹配单个区域格子里 left/top/width/height 四个百分比数值，顺序与
+# render_preview() 拼 f-string 时的书写顺序一致。
+_GEOMETRY_RE = re.compile(
+    r"left:([\d.]+)%;top:([\d.]+)%;width:([\d.]+)%;height:([\d.]+)%"
+)
+
+# render_preview() 用 `:.4f` 格式化百分比数值，舍入误差最多在 1e-4 数量级，
+# 这里留足余量，同时远小到不会掩盖真实的计算错误。
+GEOM_TOL = 1e-3
+
+
+def _parse_regions_geometry(html: str):
+    """按区域出现顺序解析出每个区域的 (left, top, width, height) 百分比元组。"""
+    return [tuple(float(v) for v in m.groups()) for m in _GEOMETRY_RE.finditer(html)]
+
+
+def _assert_geometry_close(actual, expected, *, label=""):
+    """逐区域、逐字段比对几何数值，容差 GEOM_TOL，失败时报出具体是哪个字段不符。"""
+    assert len(actual) == len(expected), (
+        f"{label}区域数不符：{len(actual)} != {len(expected)}"
+    )
+    fields = ("left", "top", "width", "height")
+    for index, (actual_vals, expected_vals) in enumerate(zip(actual, expected)):
+        for name, actual_v, expected_v in zip(fields, actual_vals, expected_vals):
+            assert abs(actual_v - expected_v) < GEOM_TOL, (
+                f"{label}区域 {index} 的 {name} 不符：{actual_v} != {expected_v}"
+            )
+
+
+def _assert_geometry_matches_parse_layout(html, rects, *, label=""):
+    """把 parse_layout() 算出的 Rect 列表换算成百分比后，与预览 HTML 里的数值比对。"""
+    expected = [
+        (
+            rect.x0 * 100,
+            rect.y0 * 100,
+            (rect.x1 - rect.x0) * 100,
+            (rect.y1 - rect.y0) * 100,
+        )
+        for rect in rects
+    ]
+    _assert_geometry_close(_parse_regions_geometry(html), expected, label=label)
+
+
 class TestRenderPreview:
     def test_default_single_row_two_columns(self, render_preview):
         html = render_preview("1,1", COLUMNS, False)
@@ -111,6 +154,52 @@ class TestRenderPreview:
         html_normal = render_preview(ratios, mmode, False)
         html_flipped = render_preview(ratios, mmode, True)
         assert html_normal != html_flipped
+
+    def test_geometry_one_dimension_equal_columns(self, render_preview):
+        # "1,1" Columns：不经由 parse_layout 中转，直接用硬编码数值锁死左右各 50%
+        html = render_preview("1,1", COLUMNS, False)
+        _assert_geometry_close(
+            _parse_regions_geometry(html),
+            [(0.0, 0.0, 50.0, 100.0), (50.0, 0.0, 50.0, 100.0)],
+        )
+
+    def test_geometry_one_dimension_uneven_columns(self, render_preview):
+        # "1,3" Columns：验证非等分，应为 25% / 75%
+        html = render_preview("1,3", COLUMNS, False)
+        _assert_geometry_close(
+            _parse_regions_geometry(html),
+            [(0.0, 0.0, 25.0, 100.0), (25.0, 0.0, 75.0, 100.0)],
+        )
+
+    def test_geometry_two_dimensional_matches_parse_layout(self, render_preview):
+        # 二维布局：5 个区域的整体尺寸与带内细分都要与 parse_layout 算出的 Rect 一致
+        ratios, mmode, flipper = "1,2,1,1;2,4,6", COLUMNS, False
+        html = render_preview(ratios, mmode, flipper)
+        rects = parse_layout(ratios, mmode, flipper)
+        assert len(rects) == 5
+        _assert_geometry_matches_parse_layout(html, rects)
+
+    def test_geometry_rows_mode_axis_not_swapped(self, render_preview):
+        # Rows 模式下先用硬编码数值验证 "1,1" 应上下各占 50%，防止 x/y 被对调
+        html = render_preview("1,1", ROWS, False)
+        _assert_geometry_close(
+            _parse_regions_geometry(html),
+            [(0.0, 0.0, 100.0, 50.0), (0.0, 50.0, 100.0, 50.0)],
+        )
+
+    def test_geometry_rows_mode_matches_parse_layout(self, render_preview):
+        # 再用二维比例串对比 parse_layout，确认 Rows 模式下带内细分也没有对调 x/y
+        ratios, mmode, flipper = "1,2,1,1;2,4,6", ROWS, False
+        html = render_preview(ratios, mmode, flipper)
+        rects = parse_layout(ratios, mmode, flipper)
+        _assert_geometry_matches_parse_layout(html, rects)
+
+    def test_geometry_flipper_matches_parse_layout(self, render_preview):
+        # flipper=True 时预览的几何数值同样应与 parse_layout 结果一致
+        ratios, mmode, flipper = "1,2,1,1;2,4,6", COLUMNS, True
+        html = render_preview(ratios, mmode, flipper)
+        rects = parse_layout(ratios, mmode, flipper)
+        _assert_geometry_matches_parse_layout(html, rects)
 
     def test_invalid_ratio_returns_error_html_instead_of_raising(self, render_preview):
         html = render_preview("not-a-number", COLUMNS, False)
