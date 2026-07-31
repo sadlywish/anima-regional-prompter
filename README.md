@@ -196,6 +196,14 @@ N=3  MAE=0.00      N=4  MAE=0.00      （MAE 为逐像素平均绝对差）
   用 `p.prompt` 做门禁判定或分段都会漏掉 Style 拼进来的内容，甚至可能因为
   分隔关键字恰好来自 Style 而让整个扩展静默不生效。
 
+## 从 sd-webui-regional-prompter 迁移
+
+改 `alwayson_scripts` 的 key 一行即可跑通——20 个位置参数的顺序、含义、默认值与 RP 完全一致。
+但有一条行为差异会影响你的容错逻辑：**RP 以提示词结构为准并会静默补齐，本扩展以 Divide ratio
+为准，两者不一致时报错而非适配**。
+
+详见 [`docs/migrating-from-rp.md`](docs/migrating-from-rp.md)。
+
 ## 安装
 
 克隆到 Forge Neo 的 `extensions` 目录：
