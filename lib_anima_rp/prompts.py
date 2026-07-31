@@ -1,10 +1,17 @@
 """主提示词与负面提示词的分段。设计文档 §6。
 
-分隔关键字必须大写且是独立词。RP 原版对关键字不做任何边界判定，直接用裸字符串
-切分，因此天然支持「房间ADDBASE左边」这种关键字紧贴中文的写法，但代价是
-BREAKFAST 之类的英文单词会被误伤（切成空段 + FAST）。本模块在 RP 行为之上只加
-一层最小加固：关键字前后不能紧邻 ASCII 字母或数字（不含下划线、不含中文），
-既保留了对中文场景的支持，又修掉了误伤英文单词的问题。
+分隔关键字必须大写，且与 RP 完全一致——不做任何边界判定，直接按子串匹配/切分。
+这意味着关键字紧贴中文、下划线、标点、英文字母或数字时都能被正常识别为分隔符，
+天然支持「房间ADDBASE左边」这种中英混排写法，也支持「BREAK1boy」这种紧贴
+Danbooru 数字标签的常见写法。
+
+代价是 BREAKFAST 之类的英文单词会被误伤：BREAK 会被当成分隔符切出一个空段，
+从而触发 `split_prompt` 的空段报错。这是有意接受的取舍——响亮的报错远好过
+「关键字紧贴数字标签导致 `has_any_keyword` 判定为假、整个扩展静默不生效」这种
+用户毫无察觉的失败模式。
+
+五个关键字（ADDCOMM/ADDBASE/ADDCOL/ADDROW/BREAK）互不为对方前缀，因此交替顺序
+不影响匹配结果；将来新增关键字（例如 RP 的 ADDP）时需要重新核对这一前提。
 """
 
 import re
@@ -16,21 +23,10 @@ REGION_KEYS = ("BREAK", "ADDCOL", "ADDROW")
 
 ALL_KEYS = (KEY_COMMON, KEY_BASE) + REGION_KEYS
 
-
-def _boundary(inner: str) -> str:
-    """给关键字模式包一层边界断言。
-
-    只排除紧邻的 ASCII 字母/数字（`[A-Za-z0-9]`），不用 `\\b`（`\\b` 基于 `\\w`
-    判定，会把中文汉字也当成单词字符，导致紧贴中文的关键字识别不到）。下划线、
-    中文、标点等一律放行。
-    """
-    return r"(?<![A-Za-z0-9])(?:" + inner + r")(?![A-Za-z0-9])"
-
-
-HAS_KEYWORD_RE = re.compile(_boundary("|".join(ALL_KEYS)))
-_REGION_SPLIT_RE = re.compile(_boundary("|".join(REGION_KEYS)))
-_COMMON_SPLIT_RE = re.compile(_boundary(KEY_COMMON))
-_BASE_SPLIT_RE = re.compile(_boundary(KEY_BASE))
+HAS_KEYWORD_RE = re.compile("|".join(ALL_KEYS))
+_REGION_SPLIT_RE = re.compile("|".join(REGION_KEYS))
+_COMMON_SPLIT_RE = re.compile(KEY_COMMON)
+_BASE_SPLIT_RE = re.compile(KEY_BASE)
 
 
 @dataclass(frozen=True)
@@ -75,7 +71,7 @@ def split_prompt(prompt: str, usecom: bool, usebase: bool) -> PromptSegments:
     if not usebase:
         leftover_keys.append(KEY_BASE)
     if leftover_keys:
-        rest = re.sub(_boundary("|".join(leftover_keys)), "BREAK", rest)
+        rest = re.sub("|".join(leftover_keys), "BREAK", rest)
 
     raw_regions = _REGION_SPLIT_RE.split(rest)
     regions = []
