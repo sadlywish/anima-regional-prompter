@@ -323,8 +323,30 @@ masterpiece, best quality ADDCOMM 温暖的房间 ADDBASE 左边人物 BREAK 右
   （无 common 前缀 / 无 base 混合），不报错。这与 RP 一致，且是 x/y 图之类场景的常见状态。
 - `BREAK` / `ADDCOL` / `ADDROW`：区域分隔符，三者等价（本扩展的分区由 Divide ratio
   显式决定，RP 中三者的方向含义在此无差别）。
-- 分隔符必须大写且是独立词（正则 `\b(?:ADDCOMM|ADDBASE|ADDCOL|ADDROW|BREAK)\b`），
-  避免误伤含这些子串的单词。
+- 分隔符必须大写，且**两侧不能紧邻 ASCII 字母或数字**：
+
+  ```
+  (?<![A-Za-z0-9])(?:ADDCOMM|ADDBASE|ADDCOL|ADDROW|BREAK)(?![A-Za-z0-9])
+  ```
+
+  **不要用 `\b`。** `\b` 基于 `\w` 判定，而汉字属于 `\w`，于是 `房间ADDBASE左边`
+  两侧都不构成词边界、整句不会被切分——对中英混排的提示词是致命的。
+  上式只排除西文字母数字，中文、标点、空格紧邻时均可正常切分。
+
+  | 写法 | 是否切分 | 说明 |
+  |------|---------|------|
+  | `room ADDBASE girl` | 是 | 常规写法 |
+  | `房间ADDBASE左边` | 是 | 中文紧邻，`\b` 方案在此失效 |
+  | `room,ADDBASE,girl` | 是 | 标点紧邻 |
+  | `BREAKFAST` | 否 | 字母紧邻，避免误伤单词 |
+  | `roomADDBASEgirl` | 否 | 字母紧邻 |
+
+  > **与 RP 的差异（有意为之）**：RP 完全不做边界判定，用的是裸字符串操作
+  > （`regions.py:124` 的 `s.split(kr)`、`regions.py:334` 的 `x.count(KEYBRK)`、
+  > `rp.py:1012` 的 `replace(KEYBRK, ...)`；源码里还留着一句 TODO 说想改成正则）。
+  > 因此 RP 会把 `BREAKFAST` 切成空段加 `FAST`。本实现是 RP 行为的**严格改进**：
+  > RP 能正确处理的全部能处理，额外修掉了这个误伤。唯一分歧是 `roomADDBASEgirl`
+  > 这类字母紧邻写法我们不切而 RP 切——而 RP 切完得到的也是碎句。
 - 每段去首尾空白与多余逗号。空的区域段抛错。
 
 ### 6.1 负面提示词
